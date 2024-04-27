@@ -6,7 +6,9 @@
 #include "vector.h"
 #include "triangle.h"
 
-
+/*Declaration of the bounding box class. 
+Each box is defined by two points: the one with minimal three coordinates
+and the one with maximal coordinates*/
 class AABB{
 public:
     AABB(const Vector3 &pmin_, const Vector3 &pmax_) {
@@ -21,8 +23,12 @@ public:
     Vector3 pmax;
 };
 
+/*Decalaration of the function that computes area of a bounding box. 
+Needed to compute SAH (surface area heuristic).*/
 double get_area(const AABB &aabb);
 
+/*Function to merge two bounding boxes*/
 AABB merge(const AABB &aabb1, const AABB &aabb2);
 
+/*Function computing bounding box of a triangle*/
 AABB triangle_aabb(const triangle &t);

@@ -35,8 +35,7 @@ set(SOURCES src/obj_loader.h
 add_executable(build_tree ${SOURCES})
 
 target_include_directories(build_tree PRIVATE ${CMAKE_SOURCE_DIR}/eigen ${CMAKE_SOURCE_DIR}/libigl/include)
-# target_compile_features(build_tree PRIVATE c_std_14 cxx_std_14)
-# target_compile_options(build_tree PRIVATE -Wall -pedantic)
+
 
 
 # Copy the job scripts

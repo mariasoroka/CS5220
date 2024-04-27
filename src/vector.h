@@ -13,7 +13,6 @@ public:
     double z;
 };
 
-// double length(const Vector3 &v1, const Vector3 &v2);
 int max_component(const Vector3 &v);
 
 Vector3 operator+(const Vector3 &v1, const Vector3 &v2);

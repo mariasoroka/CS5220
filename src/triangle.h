@@ -3,6 +3,8 @@
 #include "builder.h"
 #include "vector.h"
 
+/*Declaration of the triangle class.
+Each triangle is defined by three points in 3D space*/
 class triangle{
 public:
     triangle(const Vector3 &p1_, const Vector3 &p2_, const Vector3 &p3_) : p1(p1_), p2(p2_), p3(p3_) {}
@@ -16,5 +18,6 @@ public:
     Vector3 p3;
 };
 
+/*Function to compute the center of a triangle.*/
 Vector3 get_center(const triangle &t);
 

@@ -1,10 +1,5 @@
 #include "vector.h"
 
-// double length(const Vector3 &v1, const Vector3 &v2) {
-//     Vector3 diff = v1 - v2;
-//     return sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
-// }
-
 int max_component(const Vector3 &v) {
     if (v.x > v.y && v.x > v.z) {
         return 0;
