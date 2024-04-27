@@ -36,8 +36,9 @@ SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
     // partition triangles in triangle_idxs[node.i0, node.i1] into two groups based on the position of their centers relative to split_loc
     auto it = std::partition(triangle_idxs + node.i0, triangle_idxs + node.i1,
                                     [triangle_idxs, triangle_centers, &split_loc, &axis](int i) {
-                                        return triangle_centers[triangle_idxs[i]][axis] < split_loc;
+                                        return (triangle_centers[i][axis] < split_loc);
                                     });
+
 
     // if the split is degenerate, put half of the triangles in each group
     if (it == triangle_idxs + node.i0 || it == triangle_idxs + node.i1) {
@@ -48,11 +49,11 @@ SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
     // compute bounding boxes of the two groups of triangles
     AABB aabb0 = std::transform_reduce(triangle_idxs + node.i0, it, AABB(), merge,
                                       [triangle_idxs, triangle_bounds](int i) {
-                                            return triangle_bounds[triangle_idxs[i]];
+                                            return triangle_bounds[i];
                                       });
     AABB aabb1 = std::transform_reduce(it, triangle_idxs + node.i1, AABB(), merge,
                                         [triangle_idxs, triangle_bounds](int i) {
-                                                return triangle_bounds[triangle_idxs[i]];
+                                                return triangle_bounds[i];
                                         });
 
 
@@ -99,7 +100,7 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     // choose the split with the smallest cost
     double min_cost = infinity();
-    int split_bin = -1;
+    int split_bin = 0;
     for (int i = 0; i < n_bins; i++) {
         if (costs[i] < min_cost) {
             min_cost = costs[i];
@@ -131,6 +132,7 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
     std::transform(triangles, triangles + num_triangles, triangle_centers, get_center);
     std::iota(triangle_idxs, triangle_idxs + num_triangles, 0);
 
+
     // compute the bounding box of the scene
     AABB scene_bounds = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
 
@@ -157,6 +159,7 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
         StackNode node = stack[stack_idx];
         // split the node
         SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers);
+
         // for each child of the node
         for(int i = 0; i < 2; i++) {
             StackNode child = split_node[i];
@@ -175,12 +178,13 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
             else {
                 bvh.nodes[node_idx].aabb = child.aabb;
                 bvh.nodes[node_idx].is_leaf = false;
-                stack[stack_idx] = child;
+                stack[stack_idx] = {node_idx, child.aabb, child.i0, child.i1};
                 bvh.nodes[node.node_idx].children[i] = &bvh.nodes[node_idx];
                 stack_idx++;
                 node_idx++;
             }
         }
+        
     }
 
     delete[] triangle_bounds;
@@ -189,4 +193,42 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
 
     return bvh;
 
+}
+
+struct PrintBvhNode {
+    int level;
+    int node_idx;
+    bool is_leaf;
+};
+typedef struct PrintBvhNode PrintBvhNode;
+
+void print_bvh(std::ostream &stream, const BVH &bvh, triangle* triangles){
+    PrintBvhNode stack[64];
+    int stack_idx = 0;
+    stack[stack_idx] = PrintBvhNode{0, 0, false};
+    stack_idx++;
+
+    while(stack_idx > 0){
+        stack_idx--;
+        PrintBvhNode node = stack[stack_idx];
+
+        if (node.is_leaf) {
+            stream << "Level " << node.level << std::endl;
+            stream << "Leaf node with " << bvh.leaves[node.node_idx].num_triangles << " triangles" << std::endl;
+            stream << "Bounding box: " << bvh.leaves[node.node_idx].aabb.pmin << " " << bvh.leaves[node.node_idx].aabb.pmax << std::endl;
+            for (int i = 0; i < bvh.leaves[node.node_idx].num_triangles; i++) {
+                stream << "Triangle " << bvh.leaves[node.node_idx].triangle_indices[i] << ": " << triangles[bvh.leaves[node.node_idx].triangle_indices[i]] << std::endl;
+            }
+        } else {
+            stream << "Level " << node.level << std::endl;
+            stream << "Node with two descendants" << std::endl;
+            stream << "Bounding box: " << bvh.nodes[node.node_idx].aabb.pmin << " " << bvh.nodes[node.node_idx].aabb.pmax << std::endl;
+            for (int i = 0; i < 2; i++) {
+                int idx = bvh.nodes[node.node_idx].children[i]->is_leaf ? bvh.nodes[node.node_idx].children[i] - bvh.leaves : bvh.nodes[node.node_idx].children[i] - bvh.nodes;
+                stack[stack_idx] = PrintBvhNode{node.level + 1, idx, bvh.nodes[node.node_idx].children[i]->is_leaf};
+                stack_idx++;
+            }
+        }
+
+    }
 }

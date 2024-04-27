@@ -5,8 +5,7 @@
 #include "bvh_builder.h"
 
 #include <cstring>
-#include <cstring>
-#include <string>
+#include <fstream>
 
 int find_arg_idx(int argc, char** argv, const char* option) {
     for (int i = 1; i < argc; ++i) {
@@ -30,6 +29,7 @@ char* find_string_option(int argc, char** argv, const char* option, char* defaul
 int main(int argc, char** argv) {
 
     char* savename = find_string_option(argc, argv, "-f", nullptr);
+    char* output = find_string_option(argc, argv, "-o", nullptr);
     std::string filename(savename);
     triangle* triangles;
     int num_triangles;
@@ -38,6 +38,12 @@ int main(int argc, char** argv) {
     BVH bvh = build_bvh(triangles, num_triangles, 4, 10);
     std::cout << "Built BVH with " << num_triangles << " triangles" << std::endl;
 
+    if(output != nullptr){
+        std::ofstream fsave(output);
+        print_bvh(fsave, bvh, triangles);
+        fsave.close();
+    }
+    
     delete[] triangles;
 
 }

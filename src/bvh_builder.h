@@ -38,3 +38,6 @@ public:
 max_triangles specifies how many triangles can a leaf node store.
 n_bins specifies how many bins should be used to compute the best splitting.*/
 BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_bins);
+
+/*Function to print bvh nodes*/
+void print_bvh(std::ostream &stream, const BVH &bvh, triangle* triangles);

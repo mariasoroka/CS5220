@@ -21,3 +21,5 @@ public:
 /*Function to compute the center of a triangle.*/
 Vector3 get_center(const triangle &t);
 
+std::ostream &operator<<(std::ostream &os, const triangle &t);
+
