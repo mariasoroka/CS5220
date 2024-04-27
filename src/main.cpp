@@ -5,6 +5,7 @@
 #include "bvh_builder.h"
 
 #include <cstring>
+#include <cstring>
 #include <string>
 
 int find_arg_idx(int argc, char** argv, const char* option) {
@@ -28,7 +29,7 @@ char* find_string_option(int argc, char** argv, const char* option, char* defaul
 
 int main(int argc, char** argv) {
 
-    char* savename = find_string_option(argc, argv, "--file", nullptr);
+    char* savename = find_string_option(argc, argv, "-f", nullptr);
     std::string filename(savename);
     triangle* triangles;
     int num_triangles;
