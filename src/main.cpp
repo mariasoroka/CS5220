@@ -4,10 +4,32 @@
 #include "triangle.h"
 #include "bvh_builder.h"
 
+#include <cstring>
 #include <string>
 
-int main() {
-    std::string filename = "/global/homes/m/msoroka/HW1/CS5220_2024SP/project/meshes/sphere1.obj";
+int find_arg_idx(int argc, char** argv, const char* option) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], option) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+char* find_string_option(int argc, char** argv, const char* option, char* default_value) {
+    int iplace = find_arg_idx(argc, argv, option);
+
+    if (iplace >= 0 && iplace < argc - 1) {
+        return argv[iplace + 1];
+    }
+
+    return default_value;
+}
+
+int main(int argc, char** argv) {
+
+    char* savename = find_string_option(argc, argv, "--file", nullptr);
+    std::string filename(savename);
     triangle* triangles;
     int num_triangles;
     load_obj(filename, &triangles, num_triangles);
