@@ -10,7 +10,7 @@
 
 #include <cassert>
 
-#define NUM_THREADS 16
+#define NUM_THREADS 1
 
 /*A datastructure used during the tree construction. Each instance stores
 
@@ -113,6 +113,54 @@ SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
     return SplitNode{StackNode{0, aabb0, node.i0, split_idx}, StackNode{0, aabb1, split_idx, node.i1}};
 }
 
+SplitNode get_split_node(int start, int end, double split_loc, int axis,
+
+                         const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers)
+
+{
+
+    // partition triangles in triangle_idxs[node.i0, node.i1] into two groups based on the position of their centers relative to split_loc
+
+    auto it = std::partition(triangle_idxs + start, triangle_idxs + end,
+
+                             [triangle_idxs, triangle_centers, &split_loc, &axis](int i)
+
+                             {
+                                 return (triangle_centers[i][axis] < split_loc);
+                             });
+
+    // if the split is degenerate, put half of the triangles in each group
+
+    if (it == triangle_idxs + start || it == triangle_idxs + end)
+
+    {
+
+        it = triangle_idxs + (start + end) / 2;
+    }
+
+    // compute bounding boxes of the two groups of triangles
+
+    AABB aabb0 = std::transform_reduce(triangle_idxs + start, it, AABB(), merge,
+
+                                       [triangle_idxs, triangle_bounds](int i)
+
+                                       {
+                                           return triangle_bounds[i];
+                                       });
+
+    AABB aabb1 = std::transform_reduce(it, triangle_idxs + end, AABB(), merge,
+
+                                       [triangle_idxs, triangle_bounds](int i)
+
+                                       {
+                                           return triangle_bounds[i];
+                                       });
+
+    int split_idx = it - triangle_idxs;
+
+    return SplitNode{StackNode{0, aabb0, start, split_idx}, StackNode{0, aabb1, split_idx, end}};
+}
+
 /*This function computes the cost of splitting the node along the given axis.
 
 The node will be split in n_bins places along axis axis. For each split, the cost (surface area heuristic)
@@ -205,6 +253,44 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
     return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
 }
 
+SplitNode split(const StackNode &node, const AABB *triangle_bounds,
+
+                int *triangle_idxs, int n_bins, const Vector3 *triangle_centers, double *costs)
+
+{
+    // compute the diagonal of the bounding box of the node and choose the longest axis
+
+    Vector3 diag = node.aabb.pmax - node.aabb.pmin;
+
+    int axis = max_component(diag);
+
+    // choose the split with the smallest cost
+
+    double min_cost = infinity();
+
+    int split_bin = 0;
+
+    for (int i = 0; i < n_bins; i++)
+
+    {
+
+        if (costs[i] < min_cost)
+
+        {
+
+            min_cost = costs[i];
+
+            split_bin = i;
+        }
+    }
+
+    // compute the split
+
+    double split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
+
+    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+}
+
 /*This function builds a BVH for the given set of triangles.*/
 
 BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_bins)
@@ -239,6 +325,22 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
     AABB scene_bounds = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
 
+    // variables necessary for horizontal parallellization
+    SplitNode **partial_splits = new SplitNode *[n_bins]; // can probably declare this earlier
+    int **num_n0 = new int *[n_bins];
+    int **num_n1 = new int *[n_bins];
+    AABB **AABB_n0 = new AABB *[n_bins];
+    AABB **AABB_n1 = new AABB *[n_bins];
+    for (int i = 0; i < n_bins; ++i)
+    {
+        partial_splits[i] = new SplitNode[NUM_THREADS];
+        num_n0[i] = new int[NUM_THREADS];
+        num_n1[i] = new int[NUM_THREADS];
+        AABB_n0[i] = new AABB[NUM_THREADS];
+        AABB_n1[i] = new AABB[NUM_THREADS];
+    }
+    double *costs = new double[n_bins];
+
     // counters for number of nodes and leaves
 
     int node_idx = 0;
@@ -248,55 +350,56 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     // initialize the root of the tree and add it to the bvh.nodes array
 
     StackNode root = StackNode{0, scene_bounds, 0, num_triangles};
-
     bvh.nodes[0].aabb = scene_bounds;
-
     bvh.nodes[0].is_leaf = false;
-
     node_idx++;
-
-    // set up the stack for the tree construction
-
-    StackNode stack[64];
-
     std::deque<StackNode> queue;
-
     queue.push_back(root);
-
-    // int stack_idx = 0;
-
-    // stack[stack_idx] = root;
-
-    // stack_idx++;
-
-    // basically keep track of stack_idx
-
-    // while there are nodes to split
+    // while there are nodes to split horizontal parallelization step
 
     while (queue.size() > 0 && queue.size() < NUM_THREADS)
-
     {
-
+        // std::cout << "queue size is  " << queue.size() << " increasing \n" << std::endl;
         // pop the node from the stack
-
-        // stack_idx--;
-
-        // StackNode node = stack[stack_idx];
-
         StackNode node = queue.front();
-
         queue.pop_front();
 
-        // split the node
+        // get necessary parameters for split
+        Vector3 diag = node.aabb.pmax - node.aabb.pmin;
+        int axis = max_component(diag);
+#pragma omp parallel shared(node) shared(triangle_idxs) shared(num_n0) shared(num_n1) shared(AABB_n0) shared(AABB_n1) shared(triangle_bounds)
+        {
+            // each thread works on a subsection of triangles
+            int thread_idx = omp_get_thread_num();
+            int curr_num_triangles = node.i1 - node.i0;
+            int start = node.i0 + thread_idx * (curr_num_triangles) / NUM_THREADS;
+            int end = node.i0 + (thread_idx == NUM_THREADS - 1 ? curr_num_triangles : (thread_idx + 1) * curr_num_triangles / NUM_THREADS);
 
-        SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers);
+            for (int i = 0; i < n_bins; i++)
+            {
+                double split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
+                SplitNode sub_split_node = get_split_node(start, end, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+                num_n0[i][thread_idx] = sub_split_node.child0.i1 - sub_split_node.child0.i0;
+                num_n1[i][thread_idx] = sub_split_node.child1.i1 - sub_split_node.child1.i0;
+                AABB_n0[i][thread_idx] = sub_split_node.child0.aabb;
+                AABB_n1[i][thread_idx] = sub_split_node.child1.aabb;
+            }
+        }
+
+        for (int i = 0; i < n_bins; i++)
+        {
+            AABB total_AABB_n0 = std::reduce(AABB_n0[i], AABB_n0[i] + NUM_THREADS, AABB(), merge);
+            AABB total_AABB_n1 = std::reduce(AABB_n1[i], AABB_n1[i] + NUM_THREADS, AABB(), merge);
+            int total_num_n0 = std::reduce(num_n0[i], num_n0[i] + NUM_THREADS, 0, std::plus<>());
+            int total_num_n1 = std::reduce(num_n1[i], num_n1[i] + NUM_THREADS, 0, std::plus<>());
+            costs[i] = get_area(total_AABB_n0) * (total_num_n0) + get_area(total_AABB_n1) * (total_num_n1);
+        }
+        SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers, costs);
 
         // for each child of the node
 
         for (int i = 0; i < 2; i++)
-
         {
-
             StackNode child = split_node[i];
 
             // if the child is a leaf, add it to the bvh.leaves array
@@ -304,126 +407,113 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             if (child.i1 - child.i0 <= max_triangles)
 
             {
-
                 bvh.leaves[leaf_idx].aabb = child.aabb;
-
                 bvh.leaves[leaf_idx].is_leaf = true;
-
                 bvh.leaves[leaf_idx].num_triangles = child.i1 - child.i0;
-
                 bvh.leaves[leaf_idx].triangle_indices = new int[bvh.leaves[leaf_idx].num_triangles];
-
                 std::copy(triangle_idxs + child.i0, triangle_idxs + child.i1, bvh.leaves[leaf_idx].triangle_indices);
-
                 bvh.nodes[node.node_idx].children[i] = &bvh.leaves[leaf_idx];
-
                 leaf_idx++;
             }
 
             // if the child is not a leaf, add it to the bvh.nodes array and push it to the stack
-
             else
-
             {
-
                 bvh.nodes[node_idx].aabb = child.aabb;
-
                 bvh.nodes[node_idx].is_leaf = false;
-
                 queue.push_back({node_idx, child.aabb, child.i0, child.i1});
-
-                // stack[stack_idx] = {node_idx, child.aabb, child.i0, child.i1};
-
                 bvh.nodes[node.node_idx].children[i] = &bvh.nodes[node_idx];
-
-                // stack_idx++;
-
                 node_idx++;
             }
         }
     }
 
-    assert(queue.size() == NUM_THREADS);
-
+    // std::cout << "queue size is  " << queue.size() << " hopefully \n" << std::endl;
+    //  assert(queue.size() == NUM_THREADS);
+    if (queue.size() == NUM_THREADS)
+    {
+// vertical parallelization
 #pragma omp parallel shared(bvh) shared(node_idx) shared(leaf_idx)
 
-    {
-        int curr_node_idx;
-        int curr_leaf_idx;
-        int thread_idx = omp_get_thread_num();
-        // int thread_idx = 1;
-
-        StackNode root = queue[thread_idx];
-        // node_idx++;
-        StackNode stack[64];
-        int stack_idx = 0;
-        stack[stack_idx] = root;
-        stack_idx++;
-
-        while (stack_idx > 0)
-
         {
+            int curr_node_idx;
+            int curr_leaf_idx;
+            int thread_idx = omp_get_thread_num();
+            // std::cout << "thread  " << thread_idx << " is working" << std::endl;
+            //  int thread_idx = 1;
 
-            // pop the node from the stack
+            StackNode root = queue[thread_idx];
+            // node_idx++;
+            StackNode stack[64];
+            int stack_idx = 0;
+            stack[stack_idx] = root;
+            stack_idx++;
 
-            stack_idx--;
-
-            StackNode node = stack[stack_idx];
-
-            // split the node
-
-            SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers);
-
-            // for each child of the node
-
-            for (int i = 0; i < 2; i++)
+            while (stack_idx > 0)
 
             {
 
-                StackNode child = split_node[i];
+                // pop the node from the stack
 
-                // if the child is a leaf, add it to the bvh.leaves array
+                stack_idx--;
 
-                if (child.i1 - child.i0 <= max_triangles)
+                StackNode node = stack[stack_idx];
 
-                {
+                // split the node
 
-                    // atomic
+                SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers);
 
-#pragma omp atomic capture
-                    curr_leaf_idx = ++leaf_idx;
+                // for each child of the node
 
-                    bvh.leaves[curr_leaf_idx].aabb = child.aabb;
-
-                    bvh.leaves[curr_leaf_idx].is_leaf = true;
-
-                    bvh.leaves[curr_leaf_idx].num_triangles = child.i1 - child.i0;
-
-                    bvh.leaves[curr_leaf_idx].triangle_indices = new int[bvh.leaves[curr_leaf_idx].num_triangles];
-
-                    std::copy(triangle_idxs + child.i0, triangle_idxs + child.i1, bvh.leaves[curr_leaf_idx].triangle_indices);
-
-                    bvh.nodes[node.node_idx].children[i] = &bvh.leaves[curr_leaf_idx];
-                }
-
-                // if the child is not a leaf, add it to the bvh.nodes array and push it to the stack
-
-                else
+                for (int i = 0; i < 2; i++)
 
                 {
 
+                    StackNode child = split_node[i];
+
+                    // if the child is a leaf, add it to the bvh.leaves array
+
+                    if (child.i1 - child.i0 <= max_triangles)
+
+                    {
+
+                        // atomic
+
 #pragma omp atomic capture
-                    curr_node_idx = ++node_idx;
+                        curr_leaf_idx = ++leaf_idx;
 
-                    bvh.nodes[curr_node_idx].aabb = child.aabb;
+                        bvh.leaves[curr_leaf_idx].aabb = child.aabb;
 
-                    bvh.nodes[curr_node_idx].is_leaf = false;
+                        bvh.leaves[curr_leaf_idx].is_leaf = true;
 
-                    stack[stack_idx] = {curr_node_idx, child.aabb, child.i0, child.i1};
+                        bvh.leaves[curr_leaf_idx].num_triangles = child.i1 - child.i0;
 
-                    bvh.nodes[node.node_idx].children[i] = &bvh.nodes[curr_node_idx];
+                        bvh.leaves[curr_leaf_idx].triangle_indices = new int[bvh.leaves[curr_leaf_idx].num_triangles];
 
-                    stack_idx++;
+                        std::copy(triangle_idxs + child.i0, triangle_idxs + child.i1, bvh.leaves[curr_leaf_idx].triangle_indices);
+
+                        bvh.nodes[node.node_idx].children[i] = &bvh.leaves[curr_leaf_idx];
+                    }
+
+                    // if the child is not a leaf, add it to the bvh.nodes array and push it to the stack
+
+                    else
+
+                    {
+
+#pragma omp atomic capture
+                        curr_node_idx = ++node_idx;
+
+                        bvh.nodes[curr_node_idx].aabb = child.aabb;
+
+                        bvh.nodes[curr_node_idx].is_leaf = false;
+
+                        stack[stack_idx] = {curr_node_idx, child.aabb, child.i0, child.i1};
+
+                        bvh.nodes[node.node_idx].children[i] = &bvh.nodes[curr_node_idx];
+
+                        stack_idx++;
+                    }
                 }
             }
         }
@@ -514,3 +604,8 @@ void print_bvh(std::ostream &stream, const BVH &bvh, triangle *triangles)
         }
     }
 }
+
+
+
+
+
