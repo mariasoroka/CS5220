@@ -1,49 +1,96 @@
 #include "builder.h"
+
 #include "obj_loader.h"
+
 #include "vector.h"
+
 #include "triangle.h"
+
 #include "bvh_builder.h"
 
+#include <chrono>
+
 #include <cstring>
+
 #include <fstream>
 
-int find_arg_idx(int argc, char** argv, const char* option) {
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], option) == 0) {
+int find_arg_idx(int argc, char **argv, const char *option)
+
+{
+
+    for (int i = 1; i < argc; ++i)
+
+    {
+
+        if (strcmp(argv[i], option) == 0)
+
+        {
+
             return i;
         }
     }
+
     return -1;
 }
 
-char* find_string_option(int argc, char** argv, const char* option, char* default_value) {
+char *find_string_option(int argc, char **argv, const char *option, char *default_value)
+
+{
+
     int iplace = find_arg_idx(argc, argv, option);
 
-    if (iplace >= 0 && iplace < argc - 1) {
+    if (iplace >= 0 && iplace < argc - 1)
+
+    {
+
         return argv[iplace + 1];
     }
 
     return default_value;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
 
-    char* savename = find_string_option(argc, argv, "-f", nullptr);
-    char* output = find_string_option(argc, argv, "-o", nullptr);
+{
+
+    char *savename = find_string_option(argc, argv, "-f", nullptr);
+
+    char *output = find_string_option(argc, argv, "-o", nullptr);
+
     std::string filename(savename);
-    triangle* triangles;
+
+    triangle *triangles;
+
     int num_triangles;
+
     load_obj(filename, &triangles, num_triangles);
 
+    auto start_time = std::chrono::steady_clock::now();
+
     BVH bvh = build_bvh(triangles, num_triangles, 4, 10);
+
     std::cout << "Built BVH with " << num_triangles << " triangles" << std::endl;
 
-    if(output != nullptr){
+    if (output != nullptr)
+
+    {
+
         std::ofstream fsave(output);
+
         print_bvh(fsave, bvh, triangles);
+
         fsave.close();
     }
-    
-    delete[] triangles;
 
+    auto end_time = std::chrono::steady_clock::now();
+
+    std::chrono::duration<double> diff = end_time - start_time;
+
+    double seconds = diff.count();
+
+    // Finalize
+
+    std::cout << "Simulation Time = " << seconds << " seconds for " << num_triangles << " triangles.\n";
+
+    delete[] triangles;
 }

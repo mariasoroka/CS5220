@@ -3,6 +3,11 @@ project(parallel_bvh LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
+find_package(OpenMP REQUIRED)
+# If OpenMP is found, add the flag to compiler options
+if(OpenMP_CXX_FOUND)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+endif()
 
 
 # We require the GNU compiler for this assignment.
