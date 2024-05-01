@@ -6,5 +6,5 @@
 #SBATCH -t 00:30:00
 
 #run the application:
-srun -n 1 -c 1 --cpu_bind=cores ./build_tree
+srun -n 1 -c 1 --cpu_bind=cores ./build_tree 
 

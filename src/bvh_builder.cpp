@@ -10,7 +10,7 @@
 
 #include <cassert>
 
-#define NUM_THREADS 1
+#define NUM_THREADS 8
 
 /*A datastructure used during the tree construction. Each instance stores
 
@@ -326,18 +326,30 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     AABB scene_bounds = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
 
     // variables necessary for horizontal parallellization
-    SplitNode **partial_splits = new SplitNode *[n_bins]; // can probably declare this earlier
-    int **num_n0 = new int *[n_bins];
-    int **num_n1 = new int *[n_bins];
-    AABB **AABB_n0 = new AABB *[n_bins];
-    AABB **AABB_n1 = new AABB *[n_bins];
-    for (int i = 0; i < n_bins; ++i)
+    // SplitNode **partial_splits = new SplitNode *[n_bins]; // can probably declare this earlier
+    // int **num_n0 = new int *[n_bins];
+    // int **num_n1 = new int *[n_bins];
+    // AABB **AABB_n0 = new AABB *[n_bins];
+    // AABB **AABB_n1 = new AABB *[n_bins];
+
+    SplitNode **partial_splits = new SplitNode *[NUM_THREADS]; // can probably declare this earlier
+    int **num_n0 = new int *[NUM_THREADS];
+    int **num_n1 = new int *[NUM_THREADS];
+    AABB **AABB_n0 = new AABB *[NUM_THREADS];
+    AABB **AABB_n1 = new AABB *[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; ++i)
     {
-        partial_splits[i] = new SplitNode[NUM_THREADS];
-        num_n0[i] = new int[NUM_THREADS];
-        num_n1[i] = new int[NUM_THREADS];
-        AABB_n0[i] = new AABB[NUM_THREADS];
-        AABB_n1[i] = new AABB[NUM_THREADS];
+        // partial_splits[i] = new SplitNode[NUM_THREADS];
+        // num_n0[i] = new int[NUM_THREADS];
+        // num_n1[i] = new int[NUM_THREADS];
+        // AABB_n0[i] = new AABB[NUM_THREADS];
+        // AABB_n1[i] = new AABB[NUM_THREADS];
+
+        partial_splits[i] = new SplitNode[n_bins];
+        num_n0[i] = new int[n_bins];
+        num_n1[i] = new int[n_bins];
+        AABB_n0[i] = new AABB[n_bins];
+        AABB_n1[i] = new AABB[n_bins];
     }
     double *costs = new double[n_bins];
 
@@ -379,20 +391,27 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             {
                 double split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
                 SplitNode sub_split_node = get_split_node(start, end, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
-                num_n0[i][thread_idx] = sub_split_node.child0.i1 - sub_split_node.child0.i0;
-                num_n1[i][thread_idx] = sub_split_node.child1.i1 - sub_split_node.child1.i0;
-                AABB_n0[i][thread_idx] = sub_split_node.child0.aabb;
-                AABB_n1[i][thread_idx] = sub_split_node.child1.aabb;
+                num_n0[thread_idx][i] = sub_split_node.child0.i1 - sub_split_node.child0.i0;
+                num_n1[thread_idx][i] = sub_split_node.child1.i1 - sub_split_node.child1.i0;
+                AABB_n0[thread_idx][i] = sub_split_node.child0.aabb;
+                AABB_n1[thread_idx][i] = sub_split_node.child1.aabb;
             }
         }
 
         for (int i = 0; i < n_bins; i++)
-        {
-            AABB total_AABB_n0 = std::reduce(AABB_n0[i], AABB_n0[i] + NUM_THREADS, AABB(), merge);
-            AABB total_AABB_n1 = std::reduce(AABB_n1[i], AABB_n1[i] + NUM_THREADS, AABB(), merge);
-            int total_num_n0 = std::reduce(num_n0[i], num_n0[i] + NUM_THREADS, 0, std::plus<>());
-            int total_num_n1 = std::reduce(num_n1[i], num_n1[i] + NUM_THREADS, 0, std::plus<>());
+        {   
+            AABB total_AABB_n0 = AABB();
+            AABB total_AABB_n1 = AABB();
+            int total_num_n0 = 0;
+            int total_num_n1 = 0;
+            for(int j = 0; j < NUM_THREADS; ++j) {
+                total_num_n0+= num_n0[j][i];
+                total_num_n1+= num_n1[j][i];
+                total_AABB_n0 = merge(total_AABB_n0, AABB_n0[j][i]);
+                total_AABB_n1 = merge(total_AABB_n1, AABB_n1[j][i]);
+            }
             costs[i] = get_area(total_AABB_n0) * (total_num_n0) + get_area(total_AABB_n1) * (total_num_n1);
+
         }
         SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers, costs);
 
@@ -604,8 +623,3 @@ void print_bvh(std::ostream &stream, const BVH &bvh, triangle *triangles)
         }
     }
 }
-
-
-
-
-
