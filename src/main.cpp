@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include <fstream>
+#include <chrono>
 
 int find_arg_idx(int argc, char **argv, const char *option)
 
@@ -65,11 +66,17 @@ int main(int argc, char **argv)
 
     load_obj(filename, &triangles, num_triangles);
 
-    auto start_time = std::chrono::steady_clock::now();
-
+    auto start = std::chrono::high_resolution_clock::now();
     BVH bvh = build_bvh(triangles, num_triangles, 4, 10);
+    auto end = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Built BVH with " << num_triangles << " triangles" << std::endl;
+    float buildTime = std::chrono::duration<float>(end-start).count();
+    printf("Built BVH with %i triangles in %f ms\n", num_triangles, 1000.0f * buildTime);
+    printf("Levels:\n");
+    for (int level = 0; level < bvh.levelInfos.size(); ++level) {
+        const auto& info = bvh.levelInfos[level];
+        printf("  %i: %i splits, %f ms\n", level, info.splits, 1000.0f * info.time);
+    }
 
     if (output != nullptr)
 
@@ -81,16 +88,6 @@ int main(int argc, char **argv)
 
         fsave.close();
     }
-
-    auto end_time = std::chrono::steady_clock::now();
-
-    std::chrono::duration<double> diff = end_time - start_time;
-
-    double seconds = diff.count();
-
-    // Finalize
-
-    std::cout << "Simulation Time = " << seconds << " seconds for " << num_triangles << " triangles.\n";
 
     delete[] triangles;
 }

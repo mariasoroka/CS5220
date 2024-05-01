@@ -1,6 +1,7 @@
 #include <algorithm>
 
 #include <numeric>
+#include <chrono>
 
 #include "bvh_builder.h"
 
@@ -33,6 +34,7 @@ struct StackNode
     int i0;
 
     int i1;
+    int level;
 };
 
 typedef struct StackNode StackNode;
@@ -110,7 +112,9 @@ SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
 
     int split_idx = it - triangle_idxs;
 
-    return SplitNode{StackNode{0, aabb0, node.i0, split_idx}, StackNode{0, aabb1, split_idx, node.i1}};
+    return SplitNode{
+        StackNode{0, aabb0, node.i0, split_idx, node.level+1}, 
+        StackNode{0, aabb1, split_idx, node.i1, node.level+1}};
 }
 
 SplitNode get_split_node(int start, int end, double split_loc, int axis,
@@ -360,8 +364,7 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     int leaf_idx = 0;
 
     // initialize the root of the tree and add it to the bvh.nodes array
-
-    StackNode root = StackNode{0, scene_bounds, 0, num_triangles};
+    StackNode root = StackNode{0, scene_bounds, 0, num_triangles, 0};
     bvh.nodes[0].aabb = scene_bounds;
     bvh.nodes[0].is_leaf = false;
     node_idx++;
@@ -373,6 +376,8 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     {
         // std::cout << "queue size is  " << queue.size() << " increasing \n" << std::endl;
         // pop the node from the stack
+        auto start = std::chrono::high_resolution_clock::now();
+
         StackNode node = queue.front();
         queue.pop_front();
 
@@ -440,10 +445,23 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             {
                 bvh.nodes[node_idx].aabb = child.aabb;
                 bvh.nodes[node_idx].is_leaf = false;
-                queue.push_back({node_idx, child.aabb, child.i0, child.i1});
+                queue.push_back({node_idx, child.aabb, child.i0, child.i1, child.level});
                 bvh.nodes[node.node_idx].children[i] = &bvh.nodes[node_idx];
                 node_idx++;
             }
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+
+        #pragma omp master
+        {
+            // Instrument this split
+            if (node.level >= bvh.levelInfos.size()) {
+                bvh.levelInfos.push_back({});
+            }
+            BVH::LevelInfo& info = bvh.levelInfos[node.level];
+            info.splits += 1;
+            info.time += std::chrono::duration<float>(end-start).count();
         }
     }
 
@@ -471,7 +489,7 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             while (stack_idx > 0)
 
             {
-
+                auto start = std::chrono::high_resolution_clock::now();
                 // pop the node from the stack
 
                 stack_idx--;
@@ -527,12 +545,25 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
                         bvh.nodes[curr_node_idx].is_leaf = false;
 
-                        stack[stack_idx] = {curr_node_idx, child.aabb, child.i0, child.i1};
+                        stack[stack_idx] = {curr_node_idx, child.aabb, child.i0, child.i1, child.level};
 
                         bvh.nodes[node.node_idx].children[i] = &bvh.nodes[curr_node_idx];
 
                         stack_idx++;
                     }
+                }
+
+                auto end = std::chrono::high_resolution_clock::now();
+
+                #pragma omp critical
+                {
+                    // Instrument this split
+                    if (node.level >= bvh.levelInfos.size()) {
+                        bvh.levelInfos.push_back({});
+                    }
+                    BVH::LevelInfo& info = bvh.levelInfos[node.level];
+                    info.splits += 1;
+                    info.time += std::chrono::duration<float>(end-start).count();
                 }
             }
         }
