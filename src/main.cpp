@@ -41,11 +41,11 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
 
     float buildTime = std::chrono::duration<float>(end-start).count();
-    printf("Built BVH with %i triangles in %fms\n", num_triangles, 1000.0f * buildTime);
+    printf("Built BVH with %i triangles in %f ms\n", num_triangles, 1000.0f * buildTime);
     printf("Levels:\n");
     for (int level = 0; level < bvh.levelInfos.size(); ++level) {
         const auto& info = bvh.levelInfos[level];
-        printf("  %i: %i splits, %fms\n", level, info.splits, 1000.0f * info.time);
+        printf("  %i: %i splits, %f ms\n", level, info.splits, 1000.0f * info.time);
     }
 
     if(output != nullptr){
