@@ -5,6 +5,8 @@
 #include "triangle.h"
 #include "aabb.h"
 
+#include <vector>
+
 /*BVH node class. Each node stroes its bounding box, pointers to two decendants if it is not a leaf node,
 indices of triangles covered by the node if it is a leaf node.*/
 class BVHNode {
@@ -32,6 +34,15 @@ public:
         delete[] nodes;
         delete[] leaves;
     }
+
+    struct LevelInfo {
+        // The number of splits on this level
+        int splits = 0;
+        // Time spent processing this level (in seconds)
+        float time = 0.0f;
+    };
+
+    std::vector<LevelInfo> levelInfos;
 };
 
 /*Function building a bvh tree from an array of triangles.

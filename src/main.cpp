@@ -36,7 +36,12 @@ int main(int argc, char** argv) {
     load_obj(filename, &triangles, num_triangles);
 
     BVH bvh = build_bvh(triangles, num_triangles, 4, 10);
-    std::cout << "Built BVH with " << num_triangles << " triangles" << std::endl;
+    printf("Built BVH with %i triangles\n", num_triangles);
+    printf("Levels:\n");
+    for (int level = 0; level < bvh.levelInfos.size(); ++level) {
+        const auto& info = bvh.levelInfos[level];
+        printf("  %i: %i splits, %fms\n", level, info.splits, 1000.0f * info.time);
+    }
 
     if(output != nullptr){
         std::ofstream fsave(output);
