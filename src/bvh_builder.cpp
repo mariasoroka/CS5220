@@ -11,7 +11,7 @@
 
 #include <cassert>
 
-#define NUM_THREADS 8
+#define NUM_THREADS 4
 
 /*A datastructure used during the tree construction. Each instance stores
 
@@ -468,16 +468,18 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     // std::cout << "queue size is  " << queue.size() << " hopefully \n" << std::endl;
     //  assert(queue.size() == NUM_THREADS);
     if (queue.size() == NUM_THREADS)
-    {
-// vertical parallelization
-#pragma omp parallel shared(bvh) shared(node_idx) shared(leaf_idx)
+    {   
+        std::vector<BVH::LevelInfo> threadLevelInfos[NUM_THREADS];
 
+// vertical parallelization
+#pragma omp parallel shared(bvh) shared(node_idx) shared(leaf_idx) shared(threadLevelInfos)
         {
             int curr_node_idx;
             int curr_leaf_idx;
             int thread_idx = omp_get_thread_num();
             // std::cout << "thread  " << thread_idx << " is working" << std::endl;
             //  int thread_idx = 1;
+            threadLevelInfos[thread_idx] = bvh.levelInfos;
 
             StackNode root = queue[thread_idx];
             // node_idx++;
@@ -485,6 +487,8 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             int stack_idx = 0;
             stack[stack_idx] = root;
             stack_idx++;
+
+            auto& locallevelInfos = threadLevelInfos[thread_idx];
 
             while (stack_idx > 0)
 
@@ -555,15 +559,28 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
                 auto end = std::chrono::high_resolution_clock::now();
 
-                #pragma omp critical
-                {
-                    // Instrument this split
-                    if (node.level >= bvh.levelInfos.size()) {
-                        bvh.levelInfos.push_back({});
-                    }
-                    BVH::LevelInfo& info = bvh.levelInfos[node.level];
-                    info.splits += 1;
-                    info.time += std::chrono::duration<float>(end-start).count();
+                // Instrument this split
+                if (node.level >= locallevelInfos.size()) {
+                    locallevelInfos.push_back({0, 0.0f});
+                }
+                BVH::LevelInfo& info = locallevelInfos[node.level];
+                info.splits += 1;
+                info.time += std::chrono::duration<float>(end-start).count();
+            }
+        }
+
+        // reduce times using max
+        int startLevel = bvh.levelInfos.size();
+        #pragma omp master
+        for (int tid = 0; tid < NUM_THREADS; ++tid) {
+            for (int level = startLevel; level < threadLevelInfos[tid].size(); ++level) {
+                const auto& tInfo = threadLevelInfos[tid][level];
+                if (level >= bvh.levelInfos.size()) {
+                    bvh.levelInfos.push_back(tInfo);
+                } else {
+                    auto& mInfo = bvh.levelInfos[level];
+                    mInfo.splits += tInfo.splits;
+                    mInfo.time = std::max(mInfo.time, tInfo.time);
                 }
             }
         }
