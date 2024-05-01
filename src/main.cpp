@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <chrono>
 
 int find_arg_idx(int argc, char** argv, const char* option) {
     for (int i = 1; i < argc; ++i) {
@@ -35,8 +36,12 @@ int main(int argc, char** argv) {
     int num_triangles;
     load_obj(filename, &triangles, num_triangles);
 
+    auto start = std::chrono::high_resolution_clock::now();
     BVH bvh = build_bvh(triangles, num_triangles, 4, 10);
-    printf("Built BVH with %i triangles\n", num_triangles);
+    auto end = std::chrono::high_resolution_clock::now();
+
+    float buildTime = std::chrono::duration<float>(end-start).count();
+    printf("Built BVH with %i triangles in %fms\n", num_triangles, 1000.0f * buildTime);
     printf("Levels:\n");
     for (int level = 0; level < bvh.levelInfos.size(); ++level) {
         const auto& info = bvh.levelInfos[level];
