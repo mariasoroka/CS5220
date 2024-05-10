@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <numeric>
+#include <chrono>
 
 #include "bvh_builder.h"
 
@@ -14,6 +15,7 @@ struct StackNode {
     AABB aabb;
     int i0;
     int i1;
+    int level;
 };
 typedef struct StackNode StackNode;
 
@@ -59,8 +61,9 @@ SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
 
     int split_idx = it - triangle_idxs;
 
-
-    return SplitNode{StackNode{0, aabb0, node.i0, split_idx}, StackNode{0, aabb1, split_idx, node.i1}};
+    return SplitNode{
+        StackNode{0, aabb0, node.i0, split_idx, node.level+1}, 
+        StackNode{0, aabb1, split_idx, node.i1, node.level+1}};
 }
 
 /*This function computes the cost of splitting the node along the given axis. 
@@ -141,7 +144,7 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
     int leaf_idx = 0;
 
     // initialize the root of the tree and add it to the bvh.nodes array
-    StackNode root = StackNode{0, scene_bounds, 0, num_triangles};
+    StackNode root = StackNode{0, scene_bounds, 0, num_triangles, 0};
     bvh.nodes[0].aabb = scene_bounds;
     bvh.nodes[0].is_leaf = false;
     node_idx++;
@@ -157,6 +160,9 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
         // pop the node from the stack
         stack_idx--;
         StackNode node = stack[stack_idx];
+
+        auto start = std::chrono::high_resolution_clock::now();
+
         // split the node
         SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers);
 
@@ -178,13 +184,22 @@ BVH build_bvh(triangle* triangles, int num_triangles, int max_triangles, int n_b
             else {
                 bvh.nodes[node_idx].aabb = child.aabb;
                 bvh.nodes[node_idx].is_leaf = false;
-                stack[stack_idx] = {node_idx, child.aabb, child.i0, child.i1};
+                stack[stack_idx] = {node_idx, child.aabb, child.i0, child.i1, child.level};
                 bvh.nodes[node.node_idx].children[i] = &bvh.nodes[node_idx];
                 stack_idx++;
                 node_idx++;
             }
         }
-        
+
+        auto end = std::chrono::high_resolution_clock::now();
+
+        // Instrument this split
+        if (node.level >= bvh.levelInfos.size()) {
+            bvh.levelInfos.push_back({});
+        }
+        BVH::LevelInfo& info = bvh.levelInfos[node.level];
+        info.splits += 1;
+        info.time += std::chrono::duration<float>(end-start).count();
     }
 
     delete[] triangle_bounds;

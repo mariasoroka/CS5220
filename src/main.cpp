@@ -42,7 +42,15 @@ int main(int argc, char** argv) {
 
 #if 0
     BVH bvh = build_bvh(triangles, num_triangles, 4, 10);
-    std::cout << "Built BVH with " << num_triangles << " triangles" << std::endl;
+    auto end = std::chrono::high_resolution_clock::now();
+
+    float buildTime = std::chrono::duration<float>(end-start).count();
+    printf("Built BVH with %i triangles in %f ms\n", num_triangles, 1000.0f * buildTime);
+    printf("Levels:\n");
+    for (int level = 0; level < bvh.levelInfos.size(); ++level) {
+        const auto& info = bvh.levelInfos[level];
+        printf("  %i: %i splits, %f ms\n", level, info.splits, 1000.0f * info.time);
+    }
 
     if(output != nullptr){
         std::ofstream fsave(output);
@@ -52,7 +60,6 @@ int main(int argc, char** argv) {
 #else
     
     auto bvh = build_cuda_bvh(triangles, num_triangles);
-    std::cout << "Built CUDA BVH with " << num_triangles << " triangles\n";
 
 #endif
 
