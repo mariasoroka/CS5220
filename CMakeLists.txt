@@ -1,8 +1,5 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.18)
 project(parallel_bvh LANGUAGES C CXX CUDA)
-
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
 # We require the GNU compiler for this assignment.
 if (NOT "${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
@@ -20,8 +17,12 @@ file(GLOB SOURCE_FILES CONFIGURE_DEPENDS
     src/*.cu)
 
 add_executable(build_tree ${SOURCE_FILES})
-
-target_include_directories(build_tree PRIVATE ${CMAKE_SOURCE_DIR}/eigen ${CMAKE_SOURCE_DIR}/libigl/include)
+target_compile_features(build_tree PUBLIC cxx_std_20)
+target_compile_features(build_tree PUBLIC cuda_std_20)
+set_target_properties(build_tree PROPERTIES CUDA_ARCHITECTURES native)
+target_include_directories(build_tree PRIVATE 
+    ${CMAKE_SOURCE_DIR}/eigen 
+    ${CMAKE_SOURCE_DIR}/libigl/include)
 
 # Copy the job scripts
 configure_file(job-serial job-serial COPYONLY)
