@@ -12,9 +12,19 @@ constexpr T NP2(T n, T p) {
 // The SIMD width on the A100
 #define WARP_WIDTH 32
 
+// The optimal number of threads per threadblock on the A100
+#define OPTIMAL_WIDTH 64
+
+// The number of splits used in SAH evaluation.
+// WARP_WIDTH should be a multiple of this
+#define NUM_SPLITS   16
+#define RCP_NUM_SPLITS 0.0625f
+#define RCP_NUM_SPLITS_PLUS_ONE (1.0f / 17.0f)
+
+
 // Takes the min of the first 3 elements of A and B.
 // Fourth element is unchanged.
-__device__ inline float4 fmin3(float4 a, float4 b) {
+__device__ inline float3 fmin3(float3 a, float3 b) {
     a.x = fminf(a.x, b.x);
     a.y = fminf(a.y, b.y);
     a.z = fminf(a.z, b.z);
@@ -23,7 +33,7 @@ __device__ inline float4 fmin3(float4 a, float4 b) {
 
 // Takes the max of the first 3 elements of A and B.
 // Fourth element is unchanged.
-__device__ inline float4 fmax3(float4 a, float4 b) {
+__device__ inline float3 fmax3(float3 a, float3 b) {
     a.x = fmaxf(a.x, b.x);
     a.y = fmaxf(a.y, b.y);
     a.z = fmaxf(a.z, b.z);
@@ -53,13 +63,16 @@ __device__ inline void atomic_fmax(float* dst, float src) {
         : atomicMax((int*)dst, __float_as_int(src));
 }
 
-__device__ inline void atomic_fmin3(float4* dst, float4 src) {
+// Convenience wrappers for atomic elementwise operations on float3. Each
+// component is updated atomically, but the components may not be updated
+// simultaneously.
+__device__ inline void atomic_fmin_ew3(float3* dst, float3 src) {
     atomic_fmin(&dst->x, src.x);
     atomic_fmin(&dst->y, src.y);
     atomic_fmin(&dst->z, src.z);
 }
 
-__device__ inline void atomic_fmax3(float4* dst, float4 src) {
+__device__ inline void atomic_fmax_ew3(float3* dst, float3 src) {
     atomic_fmax(&dst->x, src.x);
     atomic_fmax(&dst->y, src.y);
     atomic_fmax(&dst->z, src.z);
@@ -70,7 +83,7 @@ __device__ inline void atomic_fmax3(float4* dst, float4 src) {
 //
 // NOTE: The split axis can be computed implicitly by taking the maximum
 // dimension from the triangle centroid bounds.
-struct Node {
+struct alignas(64) Node {
     // The index of the first triangle in this node.
     int triStart;
     // The number of triangles included in this node.
@@ -82,21 +95,23 @@ struct Node {
     int right;
 
     // Triangle geometry bounds
-    float4 tMin, tMax;
+    float3 tMin, tMax;
 
     // Triangle centroid bounds. Centroid is of the AABB, not the tri.
-    float4 cMin, cMax;
+    float3 cMin, cMax;
 
     // Constructs an empty node that's ready to store _triCount triangles
     Node(int _triStart, int _triCount)
       : triStart(_triStart), triCount(_triCount),
         left(-1), right(-1),
-        tMin { +INFINITY, +INFINITY, +INFINITY, 0.0f },
-        tMax { -INFINITY, -INFINITY, -INFINITY, 0.0f },
-        cMin { +INFINITY, +INFINITY, +INFINITY, 0.0f },
-        cMax { -INFINITY, -INFINITY, -INFINITY, 0.0f } 
+        tMin { +INFINITY, +INFINITY, +INFINITY },
+        tMax { -INFINITY, -INFINITY, -INFINITY },
+        cMin { +INFINITY, +INFINITY, +INFINITY },
+        cMax { -INFINITY, -INFINITY, -INFINITY } 
     {}
 };
+
+static_assert(sizeof(Node) == 64);
 
 struct DeviceUniforms {
     int numTris;
@@ -141,67 +156,119 @@ __global__ void setupTris(DeviceUniforms u) {
     float3 p2 = {float(tri.p2.x), float(tri.p2.y), float(tri.p2.z)};
     float3 p3 = {float(tri.p3.x), float(tri.p3.y), float(tri.p3.z)};
 
-    float4 min = {
+    float4 minId = {
         fminf(p1.x, fminf(p2.x, p3.x)),
         fminf(p1.y, fminf(p2.y, p3.y)),
         fminf(p1.z, fminf(p2.z, p3.z)),
         __int_as_float(id)
     };
-    u.triMinsIds[id] = min;
+    u.triMinsIds[id] = minId;
 
     float4 max = {
         fmaxf(p1.x, fmaxf(p2.x, p3.x)),
         fmaxf(p1.y, fmaxf(p2.y, p3.y)),
         fmaxf(p1.z, fmaxf(p2.z, p3.z)),
+        0.0f
     };
     u.triMaxs[id] = max;
 
-    float4 centroid = {
-        0.5f * (min.x + max.x),
-        0.5f * (min.y + max.y),
-        0.5f * (min.z + max.z),
-        0.0f
+    float3 centroid = {
+        0.5f * (minId.x + max.x),
+        0.5f * (minId.y + max.y),
+        0.5f * (minId.z + max.z)
     };
 
-    if (id == 0) {
-        printf("Tri %i Centroid: (%f, %f, %f)\n", 
-            id, centroid.x, centroid.y, centroid.z);
-    }
-
-    // This is WAYYYYY too many atomics
+    // This is a lot of atomics. Hopefully this does not become a bottleneck.
     Node& node = u.nodes[0];
-    atomic_fmin3(&node.tMin, min);
-    atomic_fmax3(&node.tMax, max);
-    atomic_fmin3(&node.cMin, centroid);
-    atomic_fmax3(&node.cMax, centroid);
+    atomic_fmin_ew3(&node.tMin, {minId.x, minId.y, minId.z});
+    atomic_fmax_ew3(&node.tMax, {max.x, max.y, max.z});
+    atomic_fmin_ew3(&node.cMin, centroid);
+    atomic_fmax_ew3(&node.cMax, centroid);
 }
 
+// Returns the index of the longest axis in the AABB defined by min and max.
+// Writes out the length of that axis to length.
+__device__ inline int getLongestAxis(float3 min, float3 max, float& length, float& low) {
+    int axis = 0;
+    length = max.x - min.x;
+    low = min.x;
+
+    float lenY = max.y - min.y;
+    if (lenY > length) {
+        length = lenY;
+        low = min.y;
+        axis = 1;
+    }
+
+    float lenZ = max.z - min.z;
+    if (lenZ > length) {
+        length = lenZ;
+        low = min.z;
+        axis = 2;
+    }
+
+    return axis;
+}
 
 // dynamic parallelism: why write our own load balancing code when we could just use the GPU's firmware?
 
-__global__ __launch_bounds__(WARP_WIDTH)
-void buildTree(DeviceUniforms u, int nodeId) {
+__global__ void buildTree(DeviceUniforms u, int nodeId) {
     Node& node = u.nodes[nodeId];
     int triCount = node.triCount;
-
     if (triCount <= LEAF_THRESHOLD) {
         return;
     }
 
-    // Initialize this thread's local bounds to a box with negative volume
-    float4 tMin = make_float4(+INFINITY, +INFINITY, +INFINITY, 0.0f);
-    float4 tMax = make_float4(-INFINITY, -INFINITY, -INFINITY, 0.0f);
+    // Identify binning axis
+    float axisLength, splitPos;
+    int axis = getLongestAxis(node.cMin, node.cMax, axisLength, splitPos);
 
-    // One difference from Wald's 2007 paper is that we assign triangles to
-    // threads in a round-robin fashion. This helps with memory coalescing.
-    for (int id = threadIdx.x; id < triCount; id += WARP_WIDTH) {
-        float4 min = u.triMinsIds[id];
-        float4 max = u.triMaxs[id];
-        // TODO
+    // TODO: A *LOT* of this can be optimized if I know the exact number of
+    // threads in advance.
+
+    // Each thread is assigned to exactly one split, and multiple threads can be
+    // assigned to the same split. We ensure that all threads for split #i lie
+    // within the same warp. This lets us perform warp reductions over the bin
+    // bounds at the end, and then let one representative thread can perform a
+    // threadblock reduction to find the split with the best SAH.
+    int threadsPerSplit = int(RCP_NUM_SPLITS * blockDim.x);
+
+    // Identify split position along the selected axis.
+    int threadId = blockIdx.x*blockDim.x + threadIdx.x;
+
+    // TODO: Use float match for this
+    int splitId = fdividef(threadId, threadsPerSplit);
+    int innerId = fmodf(threadId, threadsPerSplit);
+
+    splitPos += RCP_NUM_SPLITS_PLUS_ONE * axisLength * (splitId+1.0f);
+
+    /*printf("[%i] Axis %i, SplitID: %i, SplitPos: %f\n", 
+        threadId, axis, splitId, splitPos);*/
+
+    // tMin and tMax are the bounds of the *triangles* in this thread's bin.
+    // This is what Wald07 refers to as the "bin bounds" (bb).
+    // We have two sets of bounds, one for the left bin and one for the right.
+    // This comes out to 12 registers.
+    float3 ltMin, ltMax, rtMin, rtMax;
+    ltMin = rtMin = { +INFINITY, +INFINITY, +INFINITY };
+    ltMax = rtMax = { -INFINITY, -INFINITY, -INFINITY };
+    
+    // We pull the axis conditional outside of the loop to avoid rechecking it
+    // every loop iteration. GPUs don't have a branch predictor, and repeated
+    // predication is still expensive. To avoid code duplication we use a macro.
+#define BUILD_OVER(cmp) \
+    for (int id = innerId; id < triCount; id += threadsPerSplit) { \
     }
+
+    // Build bins over appropriate axis.
+         if (axis == 2)  BUILD_OVER(z)
+    else if (axis == 1)  BUILD_OVER(y)
+    else                 BUILD_OVER(x)
 
     // TODO
     return;
+
+    // TODO when setting up child nodes, use 2i+1 and 2i+2
 
     // Spawn children using dynamic parallelism
     if (threadIdx.x == 0) {
@@ -242,10 +309,10 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaMemcpyHostToDevice);
     
     // Compute triangle AABBs
-    setupTris<<<NP2(numTris, 64), 64>>>(u);
+    setupTris<<<NP2(numTris, OPTIMAL_WIDTH), OPTIMAL_WIDTH>>>(u);
 
     // Build tree (vertical parallelism only for now)
-    buildTree<<<1, 32>>>(u, 0);
+    buildTree<<<1, OPTIMAL_WIDTH>>>(u, 0);
 
     // Synchronize
     cudaDeviceSynchronize();
@@ -256,6 +323,8 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         u.nodes,
         sizeof(Node),
         cudaMemcpyDeviceToHost);
+    
+    // Debug info
     printf("Geometry: [%f, %f, %f] to [%f, %f, %f]\n", 
         root.tMin.x, root.tMin.y, root.tMin.z,
         root.tMax.x, root.tMax.y, root.tMax.z);
