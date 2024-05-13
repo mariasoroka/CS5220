@@ -14,7 +14,7 @@ constexpr T NP2(T n, T p) {
 
 // Takes the min of the first 3 elements of A and B.
 // Fourth element is unchanged.
-__device__ inline float4 min3(float4 a, float4 b) {
+__device__ inline float4 fmin3(float4 a, float4 b) {
     a.x = fminf(a.x, b.x);
     a.y = fminf(a.y, b.y);
     a.z = fminf(a.z, b.z);
@@ -23,25 +23,46 @@ __device__ inline float4 min3(float4 a, float4 b) {
 
 // Takes the max of the first 3 elements of A and B.
 // Fourth element is unchanged.
-__device__ inline float4 max3(float4 a, float4 b) {
+__device__ inline float4 fmax3(float4 a, float4 b) {
     a.x = fmaxf(a.x, b.x);
     a.y = fmaxf(a.y, b.y);
     a.z = fmaxf(a.z, b.z);
     return a;
 }
 
-__device__ inline void atomic_min3(float4* dst, float4 src) {
-    // This is legal since IEEE754 floats are bitwise monotonic
-    atomicMin((int*)&dst->x, src.x);
-    atomicMin((int*)&dst->y, src.y);
-    atomicMin((int*)&dst->z, src.z);
+__device__ inline void atomic_fmin(float* dst, float src) {
+    // Floats are monotonic wrt sign-magnitude. Suppose src >= 0. 
+    //  - If dst >= 0, then signed atomicMin will work normally.
+    //  - If dst < 0, then it will be interpreted as some negative int, and
+    //    signed atomicMin will correctly choose it as the min.
+    //
+    // Suppose src < 0.
+    //  - If dst >= 0, then unsigned atomicMax will select src, and thus
+    //    actually select the min.
+    //  - If dst < 0, then unsigned atomicMax will select the one with the
+    //    greater magnitude, which is the min since both are negative.
+    signbit(src) 
+        ? atomicMax((unsigned int*)dst, __float_as_uint(src))
+        : atomicMin((int*)dst, __float_as_int(src));
 }
 
-__device__ inline void atomic_max3(float4* dst, float4 src) {
-    // This is legal since IEEE754 floats are bitwise monotonic
-    atomicMax((int*)&dst->x, src.x);
-    atomicMax((int*)&dst->y, src.y);
-    atomicMax((int*)&dst->z, src.z);
+__device__ inline void atomic_fmax(float* dst, float src) {
+    // See reasoning for atomic_fmax.
+    signbit(src)
+        ? atomicMin((unsigned int*)dst, __float_as_uint(src))
+        : atomicMax((int*)dst, __float_as_int(src));
+}
+
+__device__ inline void atomic_fmin3(float4* dst, float4 src) {
+    atomic_fmin(&dst->x, src.x);
+    atomic_fmin(&dst->y, src.y);
+    atomic_fmin(&dst->z, src.z);
+}
+
+__device__ inline void atomic_fmax3(float4* dst, float4 src) {
+    atomic_fmax(&dst->x, src.x);
+    atomic_fmax(&dst->y, src.y);
+    atomic_fmax(&dst->z, src.z);
 }
 
 
@@ -142,12 +163,17 @@ __global__ void setupTris(DeviceUniforms u) {
         0.0f
     };
 
+    if (id == 0) {
+        printf("Tri %i Centroid: (%f, %f, %f)\n", 
+            id, centroid.x, centroid.y, centroid.z);
+    }
+
     // This is WAYYYYY too many atomics
     Node& node = u.nodes[0];
-    atomic_min3(&node.tMin, min);
-    atomic_max3(&node.tMax, max);
-    atomic_min3(&node.cMin, centroid);
-    atomic_max3(&node.cMax, centroid);
+    atomic_fmin3(&node.tMin, min);
+    atomic_fmax3(&node.tMax, max);
+    atomic_fmin3(&node.cMin, centroid);
+    atomic_fmax3(&node.cMax, centroid);
 }
 
 
@@ -178,13 +204,13 @@ void buildTree(DeviceUniforms u, int nodeId) {
     return;
 
     // Spawn children using dynamic parallelism
-    /*if (threadIdx.x == 0) {
+    if (threadIdx.x == 0) {
         cudaStream_t stream;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         buildTree<<<1, WARP_WIDTH, 0, stream>>>(u, -1);
         buildTree<<<1, WARP_WIDTH, 0, stream>>>(u, -1);
         cudaStreamDestroy(stream);
-    }*/
+    }
 }
 
 
@@ -214,7 +240,7 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         &root,
         sizeof(Node),
         cudaMemcpyHostToDevice);
-
+    
     // Compute triangle AABBs
     setupTris<<<NP2(numTris, 64), 64>>>(u);
 
@@ -223,6 +249,19 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
 
     // Synchronize
     cudaDeviceSynchronize();
+
+    // Copy device root node back onto host for debugging purposes
+    cudaMemcpy(
+        &root,
+        u.nodes,
+        sizeof(Node),
+        cudaMemcpyDeviceToHost);
+    printf("Geometry: [%f, %f, %f] to [%f, %f, %f]\n", 
+        root.tMin.x, root.tMin.y, root.tMin.z,
+        root.tMax.x, root.tMax.y, root.tMax.z);
+    printf("Centroid: [%f, %f, %f] to [%f, %f, %f]\n",
+        root.cMin.x, root.cMin.y, root.cMin.z,
+        root.cMax.x, root.cMax.y, root.cMax.z);
 
     return std::make_shared<CudaBVH>(u);
 }
