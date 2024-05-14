@@ -18,8 +18,6 @@ constexpr T NP2(T n, T p) {
 // The number of splits used in SAH evaluation.
 // WARP_WIDTH should be a multiple of this
 #define NUM_SPLITS   16
-#define RCP_NUM_SPLITS 0.0625f
-#define RCP_NUM_SPLITS_PLUS_ONE (1.0f / 17.0f)
 
 
 // Takes the min of the first 3 elements of A and B.
@@ -210,9 +208,19 @@ __device__ inline int getLongestAxis(float3 min, float3 max, float& length, floa
     return axis;
 }
 
+// Returns half the surface area of the AABB defined by min, max.
+__device__ inline float halfSurfaceArea(float3 min, float3 max) {
+    float dx = max.x - min.x;
+    float dy = max.y - min.y;
+    float dz = max.z - min.z;
+    return (dx*dy) + (dy*dz) + (dz*dx);
+}
+
 // dynamic parallelism: why write our own load balancing code when we could just use the GPU's firmware?
 
-__global__ void buildTree(DeviceUniforms u, int nodeId) {
+template <const int N>
+__global__ __launch_bounds__(N)
+void buildTree(DeviceUniforms u, int nodeId) {
     Node& node = u.nodes[nodeId];
     int triCount = node.triCount;
     if (triCount <= LEAF_THRESHOLD) {
@@ -223,32 +231,29 @@ __global__ void buildTree(DeviceUniforms u, int nodeId) {
     float axisLength, splitPos;
     int axis = getLongestAxis(node.cMin, node.cMax, axisLength, splitPos);
 
-    // TODO: A *LOT* of this can be optimized if I know the exact number of
-    // threads in advance.
-
     // Each thread is assigned to exactly one split, and multiple threads can be
     // assigned to the same split. We ensure that all threads for split #i lie
     // within the same warp. This lets us perform warp reductions over the bin
     // bounds at the end, and then let one representative thread can perform a
     // threadblock reduction to find the split with the best SAH.
-    int threadsPerSplit = int(RCP_NUM_SPLITS * blockDim.x);
+    constexpr int threadsPerSplit = N / NUM_SPLITS;
 
     // Identify split position along the selected axis.
-    int threadId = blockIdx.x*blockDim.x + threadIdx.x;
+    int threadId = N*blockIdx.x + threadIdx.x;
 
-    // TODO: Use float match for this
-    int splitId = fdividef(threadId, threadsPerSplit);
-    int innerId = fmodf(threadId, threadsPerSplit);
+    // This should be optimized down to a shift & mask, not integer division,
+    // since the divisor is constexpr
+    int splitId = threadId / threadsPerSplit;
+    int innerId = threadId % threadsPerSplit;
 
-    splitPos += RCP_NUM_SPLITS_PLUS_ONE * axisLength * (splitId+1.0f);
-
-    /*printf("[%i] Axis %i, SplitID: %i, SplitPos: %f\n", 
-        threadId, axis, splitId, splitPos);*/
+    constexpr float rcp = 1.0f / (NUM_SPLITS + 1.0f);
+    splitPos += axisLength*rcp*(splitId + 1.0f);
 
     // tMin and tMax are the bounds of the *triangles* in this thread's bin.
     // This is what Wald07 refers to as the "bin bounds" (bb).
     // We have two sets of bounds, one for the left bin and one for the right.
     // This comes out to 12 registers.
+    float inLeft = 0;
     float3 ltMin, ltMax, rtMin, rtMax;
     ltMin = rtMin = { +INFINITY, +INFINITY, +INFINITY };
     ltMax = rtMax = { -INFINITY, -INFINITY, -INFINITY };
@@ -258,12 +263,90 @@ __global__ void buildTree(DeviceUniforms u, int nodeId) {
     // predication is still expensive. To avoid code duplication we use a macro.
 #define BUILD_OVER(cmp) \
     for (int id = innerId; id < triCount; id += threadsPerSplit) { \
+        float3 min; { \
+            float4 minId4 = u.triMinsIds[id]; \
+            min = {minId4.x, minId4.y, minId4.z}; \
+        } \
+        float3 max; { \
+            float4 max4 = u.triMaxs[id]; \
+            max = {max4.x, max4.y, max4.z}; \
+        } \
+        float center = 0.5f * (max. cmp + min. cmp); \
+        bool left = (center < splitPos); \
+        min = fmin3(min, left ? ltMin : rtMin); \
+        max = fmax3(max, left ? ltMax : rtMax); \
+        if (left) { \
+            ltMin = min; ltMax = max; \
+        } else { \
+            rtMin = min; rtMax = max; \
+        }\
+        inLeft += left ? 1.0f : 0.0f; \
     }
 
     // Build bins over appropriate axis.
-         if (axis == 2)  BUILD_OVER(z)
-    else if (axis == 1)  BUILD_OVER(y)
-    else                 BUILD_OVER(x)
+    if (axis == 2) {
+        BUILD_OVER(z)
+    } else if (axis == 1) {
+        BUILD_OVER(y)
+    } else {
+        BUILD_OVER(x)
+    }
+
+    // Reduce over buddy threads. First, every thread grabs from its rightmost
+    // buddy, then from its buddy two to the right, then from its buddy four to
+    // the right, and so on.
+    //
+    // With 4 threads per split, the process looks like this:
+    // A    B    C    D
+    // AB   BC   CD   DA
+    // ABCD ABCD ABCD ABCD
+#define REDUCE(f, x) x = f (x, __shfl_up_sync(~0, x, buddy, threadsPerSplit))
+    for (int buddy = 1; buddy != threadsPerSplit; buddy *= 2) {
+        REDUCE(fminf, ltMin.x); REDUCE(fminf, ltMin.y); REDUCE(fminf, ltMin.z);
+        REDUCE(fminf, rtMin.x); REDUCE(fminf, rtMin.y); REDUCE(fminf, rtMin.z);
+
+        REDUCE(fmaxf, ltMax.x); REDUCE(fmaxf, ltMax.y); REDUCE(fmaxf, ltMax.z);
+        REDUCE(fmaxf, rtMax.x); REDUCE(fmaxf, rtMax.y); REDUCE(fmaxf, rtMax.z);
+
+        inLeft += __shfl_up_sync(~0, inLeft, buddy, threadsPerSplit);
+    }
+    
+    // Compute SAH and write out to smem
+    __shared__ float sahs[NUM_SPLITS];
+    if (innerId == 0) {
+        float inRight = float(triCount) - inLeft;
+        sahs[splitId] = inLeft*halfSurfaceArea(ltMin, ltMax) 
+                      + inRight*halfSurfaceArea(rtMin, rtMax);
+    }
+
+    // Master thread scans for least-cost split
+    __syncthreads();
+    __shared__ int selectedSplit;
+    if (threadId == 0) {
+        float minCost = sahs[0];
+        int minSplit = 0;
+        for (int curSplit=1; curSplit<NUM_SPLITS; ++curSplit) {
+            float curCost = sahs[curSplit];
+            if (curCost < minCost) {
+                minCost = curCost;
+                minSplit = curSplit;
+            }
+        }
+        selectedSplit = minSplit;
+    }
+
+    // All threads use least-cost split to partition the triangles
+    __syncthreads();
+#if 0
+    if (splitId == selectedSplit && innerId == 0) {
+        printf("Split: %i, axis %i, pos %f\n", 
+            selectedSplit, axis, splitPos);
+        printf("  L: [%f, %f, %f] to [%f, %f, %f]\n", 
+            ltMin.x, ltMin.y, ltMin.z, ltMax.x, ltMax.y, ltMax.z);
+        printf("  R: [%f, %f, %f] to [%f, %f, %f]\n", 
+            rtMin.x, rtMin.y, rtMin.z, rtMax.x, rtMax.y, rtMax.z);
+    }
+#endif
 
     // TODO
     return;
@@ -274,8 +357,8 @@ __global__ void buildTree(DeviceUniforms u, int nodeId) {
     if (threadIdx.x == 0) {
         cudaStream_t stream;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-        buildTree<<<1, WARP_WIDTH, 0, stream>>>(u, -1);
-        buildTree<<<1, WARP_WIDTH, 0, stream>>>(u, -1);
+        buildTree<N><<<1, WARP_WIDTH, 0, stream>>>(u, -1);
+        buildTree<N><<<1, WARP_WIDTH, 0, stream>>>(u, -1);
         cudaStreamDestroy(stream);
     }
 }
@@ -312,7 +395,7 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     setupTris<<<NP2(numTris, OPTIMAL_WIDTH), OPTIMAL_WIDTH>>>(u);
 
     // Build tree (vertical parallelism only for now)
-    buildTree<<<1, OPTIMAL_WIDTH>>>(u, 0);
+    buildTree<OPTIMAL_WIDTH><<<1, OPTIMAL_WIDTH>>>(u, 0);
 
     // Synchronize
     cudaDeviceSynchronize();
