@@ -5,7 +5,7 @@
 #include <igl/readOBJ.h>
 
 void load_obj(std::string filename, triangle **triangles, int &num_triangles) {
-    std::vector<std::vector<double>> V;
+    std::vector<std::vector<float>> V;
     std::vector<std::vector<int>> F;
     igl::readOBJ(filename, V, F);
 
