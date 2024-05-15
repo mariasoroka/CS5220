@@ -25,7 +25,7 @@ public:
 
 /*Decalaration of the function that computes area of a bounding box. 
 Needed to compute SAH (surface area heuristic).*/
-double get_area(const AABB &aabb);
+float get_area(const AABB &aabb);
 
 /*Function to merge two bounding boxes*/
 AABB merge(const AABB &aabb1, const AABB &aabb2);

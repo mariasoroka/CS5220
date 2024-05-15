@@ -2,6 +2,6 @@
 
 #include <limits>
 
-inline double infinity() {
-    return std::numeric_limits<double>::infinity();
+inline float infinity() {
+    return std::numeric_limits<float>::infinity();
 }

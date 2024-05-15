@@ -1,6 +1,6 @@
 #include "aabb.h"
 
-double get_area(const AABB &aabb) {
+float get_area(const AABB &aabb) {
     Vector3 diff = aabb.pmax - aabb.pmin;
     return 2 * (diff.x * diff.y + diff.y * diff.z + diff.z * diff.x);
 }

@@ -67,7 +67,7 @@ The function also uses bounding boxes of all the triangles (triangle_bounds),
 
 positions of triangle centers (triangle_centers) and indices of triangles array (triangle_idxs).*/
 
-SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
+SplitNode get_split_node(const StackNode &node, float split_loc, int axis,
 
                          const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers)
 
@@ -117,7 +117,7 @@ SplitNode get_split_node(const StackNode &node, double split_loc, int axis,
         StackNode{0, aabb1, split_idx, node.i1, node.level+1}};
 }
 
-SplitNode get_split_node(int start, int end, double split_loc, int axis,
+SplitNode get_split_node(int start, int end, float split_loc, int axis,
 
                          const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers)
 
@@ -171,7 +171,7 @@ The node will be split in n_bins places along axis axis. For each split, the cos
 
 will be computed and will be stored in costs*/
 
-void get_costs(const StackNode &node, double *costs, const AABB *triangle_bounds,
+void get_costs(const StackNode &node, float *costs, const AABB *triangle_bounds,
 
                int *triangle_idxs, int n_bins, int axis, const Vector3 *triangle_centers)
 
@@ -185,7 +185,7 @@ void get_costs(const StackNode &node, double *costs, const AABB *triangle_bounds
 
         // compute the location of the split
 
-        double split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
+        float split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
 
         // get the two children of the node if it is split at split_loc
 
@@ -224,13 +224,13 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     // allocate memory for the costs and compute them
 
-    double *costs = new double[n_bins];
+    float *costs = new float[n_bins];
 
     get_costs(node, costs, triangle_bounds, triangle_idxs, n_bins, axis, triangle_centers);
 
     // choose the split with the smallest cost
 
-    double min_cost = infinity();
+    float min_cost = infinity();
 
     int split_bin = 0;
 
@@ -252,14 +252,14 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     // compute the split
 
-    double split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
+    float split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
 
     return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
 }
 
 SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
-                int *triangle_idxs, int n_bins, const Vector3 *triangle_centers, double *costs)
+                int *triangle_idxs, int n_bins, const Vector3 *triangle_centers, float *costs)
 
 {
     // compute the diagonal of the bounding box of the node and choose the longest axis
@@ -270,7 +270,7 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     // choose the split with the smallest cost
 
-    double min_cost = infinity();
+    float min_cost = infinity();
 
     int split_bin = 0;
 
@@ -290,7 +290,7 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     // compute the split
 
-    double split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
+    float split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
 
     return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
 }
@@ -355,7 +355,7 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
         AABB_n0[i] = new AABB[n_bins];
         AABB_n1[i] = new AABB[n_bins];
     }
-    double *costs = new double[n_bins];
+    float *costs = new float[n_bins];
 
     // counters for number of nodes and leaves
 
@@ -394,7 +394,7 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
             for (int i = 0; i < n_bins; i++)
             {
-                double split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
+                float split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
                 SplitNode sub_split_node = get_split_node(start, end, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
                 num_n0[thread_idx][i] = sub_split_node.child0.i1 - sub_split_node.child0.i0;
                 num_n1[thread_idx][i] = sub_split_node.child1.i1 - sub_split_node.child1.i0;
