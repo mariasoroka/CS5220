@@ -1,23 +1,34 @@
 #include "cuda_bvh_builder.h"
 
+#include <cfloat>
+
 // Return the number of p-sized blocks needed to cover N
 template<typename T>
 constexpr T NP2(T n, T p) {
     return ((n) + (p-1)) / p;
 }
 
-// If a node contains under this number of triangles, it should become a leaf node.
-#define LEAF_THRESHOLD 4
+// The number of bins used in SAH evaluation.
+constexpr int NUM_BINS = 16;
+// The number of threads in a warp on the NVIDIA A100.
+constexpr int WARP_THREADS = 32;
+// The number of streaming multiprocessors on the NVIDIA A100.
+constexpr int NUM_SMS = 108;
+// The max number of threadgroups you can schedule on one SM on the NVIDIA A100.
+constexpr int MAX_BLOCKS_PER_SM = 32;
+// The max number of warps that can be resident on one SM on the NVIDIA A100.
+constexpr int MAX_WARPS_PER_SM = 64;
+// So to maximize utilization, we should launch 32 threadgroups per SM, and each
+// one of those threadgroups should contain 2 warps (64 threads)
+constexpr int OPT_BLOCKS = NUM_SMS * MAX_BLOCKS_PER_SM;
+constexpr int OPT_THREADS = WARP_THREADS * (MAX_WARPS_PER_SM / MAX_BLOCKS_PER_SM);
 
-// The SIMD width on the A100
-#define WARP_WIDTH 32
+// The number of items each horizontal queue needs
+// This is simply the next power of two greater than OPT_BLOCKS
+constexpr int QUEUE_SIZE = 1 << (32 - __builtin_clz(OPT_BLOCKS - 1));
 
-// The optimal number of threads per threadblock on the A100
-#define OPTIMAL_WIDTH 64
-
-// The number of splits used in SAH evaluation.
-// WARP_WIDTH should be a multiple of this
-#define NUM_SPLITS   16
+// The number of BVH levels which are built in a horizontal format
+constexpr int HORIZONTAL_LEVELS = (32 - __builtin_clz(OPT_BLOCKS+1)) - 1;
 
 
 // Takes the min of the first 3 elements of A and B.
@@ -61,6 +72,18 @@ __device__ inline void atomic_fmax(float* dst, float src) {
         : atomicMax((int*)dst, __float_as_int(src));
 }
 
+__device__ inline void atomic_fmin_block(float* dst, float src) {
+    signbit(src) 
+        ? atomicMax_block((unsigned int*)dst, __float_as_uint(src))
+        : atomicMin_block((int*)dst, __float_as_int(src));
+}
+
+__device__ inline void atomic_fmax_block(float* dst, float src) {
+    signbit(src)
+        ? atomicMin_block((unsigned int*)dst, __float_as_uint(src))
+        : atomicMax_block((int*)dst, __float_as_int(src));
+}
+
 // Convenience wrappers for atomic elementwise operations on float3. Each
 // component is updated atomically, but the components may not be updated
 // simultaneously.
@@ -76,40 +99,90 @@ __device__ inline void atomic_fmax_ew3(float3* dst, float3 src) {
     atomic_fmax(&dst->z, src.z);
 }
 
+__device__ inline void atomic_fmin_ew3_block(float3* dst, float3 src) {
+    atomic_fmin_block(&dst->x, src.x);
+    atomic_fmin_block(&dst->y, src.y);
+    atomic_fmin_block(&dst->z, src.z);
+}
+
+__device__ inline void atomic_fmax_ew3_block(float3* dst, float3 src) {
+    atomic_fmax_block(&dst->x, src.x);
+    atomic_fmax_block(&dst->y, src.y);
+    atomic_fmax_block(&dst->z, src.z);
+}
+
+// Returns half the surface area of the AABB defined by min, max.
+__device__ inline float halfSurfaceArea(float3 min, float3 max) {
+    float dx = max.x - min.x;
+    float dy = max.y - min.y;
+    float dz = max.z - min.z;
+    return (dx*dy) + (dy*dz) + (dz*dx);
+}
 
 // A BVH node (either an inner node or a leaf node.)
+// Child nodes can be computed implicitly via 2i+1 and 2i+2.
 //
 // NOTE: The split axis can be computed implicitly by taking the maximum
 // dimension from the triangle centroid bounds.
-struct alignas(64) Node {
+struct alignas(32) CompressedNode {
     // The index of the first triangle in this node.
-    int triStart;
+    uint triStart;
     // One past the index of the last triangle in this node.
-    int triEnd;
+    uint triEnd;
 
-    // Index of the left child. Negative if this is a leaf node.
-    int left;
-    // Index of the right child. Negative if this is a leaf node.
-    int right;
+    // AABB bounds. Before the node is built, these are centroid bounds.
+    // After the node is processed, these are the actual geometric bounds.
+    float3 min, max;
 
-    // Triangle geometry bounds
-    float3 tMin, tMax;
-
-    // Triangle centroid bounds. Centroid is of the AABB, not the tri.
-    float3 cMin, cMax;
-
-    // Constructs an empty node that's ready to store _triCount triangles
-    Node(int _triStart, int _triEnd)
+    // Constructs an empty node that stores from _triStart to _triEnd triangles
+    constexpr CompressedNode(int _triStart, int _triEnd)
       : triStart(_triStart), triEnd(_triEnd),
-        left(-1), right(-1),
-        tMin { +INFINITY, +INFINITY, +INFINITY },
-        tMax { -INFINITY, -INFINITY, -INFINITY },
-        cMin { +INFINITY, +INFINITY, +INFINITY },
-        cMax { -INFINITY, -INFINITY, -INFINITY } 
+        min { +INFINITY, +INFINITY, +INFINITY },
+        max { -INFINITY, -INFINITY, -INFINITY }
+    {}
+    
+    __device__ inline uint count() const {
+        return triEnd - triStart;
+    }
+
+    __device__ inline bool isLeaf() const {
+        constexpr int LEAF_THRESHOLD = 4;
+        return count() <= LEAF_THRESHOLD;
+    }
+};
+
+static_assert(sizeof(CompressedNode) == 32);
+
+
+struct TriBin {
+    uint count;
+    float3 min, max;
+
+    __device__ constexpr TriBin()
+      : count(0),
+        min { +INFINITY, +INFINITY, +INFINITY },
+        max { -INFINITY, -INFINITY, -INFINITY }
     {}
 };
 
-static_assert(sizeof(Node) == 64);
+struct TriSplit {
+    uint inLeft, inRight;
+    float3 ltMin, ltMax;
+    float3 rtMin, rtMax;
+
+    __device__ constexpr TriSplit()
+      : inLeft(0), inRight(0),
+        ltMin { +INFINITY, +INFINITY, +INFINITY },
+        ltMax { -INFINITY, -INFINITY, -INFINITY },
+        rtMin { +INFINITY, +INFINITY, +INFINITY },
+        rtMax { -INFINITY, -INFINITY, -INFINITY }
+    {}
+
+    __device__ float heuristic() const {
+        return inLeft*halfSurfaceArea(ltMin, ltMax)
+            + inRight*halfSurfaceArea(rtMin, rtMax);
+    }
+};
 
 struct DeviceUniforms {
     int numTris;
@@ -132,7 +205,16 @@ struct DeviceUniforms {
     float4* __restrict__ triMaxsAux;
 
     // Node array. Equal to 2N-1 where N is the number of triangles.
-    Node* __restrict__ nodes;
+    CompressedNode* __restrict__ nodes;
+
+    // Global bins for the horizontal binning phase.
+    // There are QUEUE_SIZE * NUM_BINS of these.
+    // Indexed by queue ID, then by bin index.
+    TriBin* __restrict__ bins;
+
+    // Global splits to store the selected splits.
+    // Indexed by queue ID.
+    TriSplit* __restrict__ splits;
 };
 
 class CudaBVH {
@@ -181,11 +263,9 @@ __global__ void setupTris(DeviceUniforms u) {
     };
 
     // This is a lot of atomics. Hopefully this does not become a bottleneck.
-    Node& node = u.nodes[0];
-    atomic_fmin_ew3(&node.tMin, {minId.x, minId.y, minId.z});
-    atomic_fmax_ew3(&node.tMax, {max.x, max.y, max.z});
-    atomic_fmin_ew3(&node.cMin, centroid);
-    atomic_fmax_ew3(&node.cMax, centroid);
+    CompressedNode& node = u.nodes[0];
+    atomic_fmin_ew3(&node.min, centroid);
+    atomic_fmax_ew3(&node.max, centroid);
 }
 
 // Returns the index of the longest axis in the AABB defined by min and max.
@@ -212,14 +292,151 @@ __device__ inline int getLongestAxis(float3 min, float3 max, float& length, floa
     return axis;
 }
 
-// Returns half the surface area of the AABB defined by min, max.
-__device__ inline float halfSurfaceArea(float3 min, float3 max) {
-    float dx = max.x - min.x;
-    float dy = max.y - min.y;
-    float dz = max.z - min.z;
-    return (dx*dy) + (dy*dz) + (dz*dx);
+__global__ void horizontalPrebin(DeviceUniforms u, uint level) {
+    // Level 0: All threadblocks process node 0.
+    // Level 1: The first half of threadblocks process node 1+0,
+    //          the other half process node 1+1.
+    // Level 2: 3+0, then 3+1, then 3+2, then 3+3
+    // Level 3: 7+0, etc
+    uint mask = (1u << level) - 1u;
+    uint queueId = mask & blockIdx.x;
+    uint nodeId = mask + queueId;
+    CompressedNode& node = u.nodes[nodeId];
+    if (node.isLeaf()) {
+        return;
+    }
+
+    // The index of this thread within all threads assigned to this node.
+    uint localBlockId = blockIdx.x >> level;
+    uint localBlocks = gridDim.x >> level;
+    uint localThreadId = localBlockId*blockDim.x + threadIdx.x;
+    uint localThreads = localBlocks*blockDim.x;
+
+    // Debug stats
+    if (localThreadId == 0 && level <= 2) {
+        printf("%*s↪ node %u: %i tris\n", level, "", nodeId, node.count());
+    }
+
+    // Identify binning axis
+    float axisLength, axisStart;
+    int axis = getLongestAxis(node.min, node.max, axisLength, axisStart);
+
+    // Precompute k1 constant from Wald07
+    constexpr float almostOne = 1.0f - 10.0f*FLT_EPSILON;
+    float k1 = (NUM_BINS*almostOne)/axisLength;
+
+    // Cache bins in shared memory. We'll atomically update the global bins afterwards.
+    // Each bin is 64 bytes, so with 16 bins we're using 1024 bytes of shared memory.
+    // If we can keep register usage < 32 then we get 100% occupancy. :)
+    __shared__ TriBin bins[NUM_BINS];
+    if (threadIdx.x < NUM_BINS) {
+        bins[threadIdx.x] = TriBin();
+    }
+    __syncthreads();
+
+    // We pull the axis conditional outside of the loop to avoid rechecking it
+    // every loop iteration. GPUs don't have a branch predictor, and repeated
+    // predication is still expensive. To avoid code duplication we use a macro.
+#define BUILD_OVER(cmp) \
+    for (uint triId = node.triStart + localThreadId; \
+              triId < node.triEnd; \
+              triId += localThreads) { \
+        float4 minId4 = u.triMinsIds[triId]; \
+        float4 max4 = u.triMaxs[triId]; \
+        float center = 0.5f * (minId4. cmp + max4. cmp); \
+        uint binId = uint(k1 * (center-axisStart)); \
+        TriBin& bin = bins[binId]; \
+        atomicAdd_block(&bin.count, 1); \
+        atomic_fmin_ew3_block(&bin.min, {minId4.x, minId4.y, minId4.z}); \
+        atomic_fmax_ew3_block(&bin.max, {max4.x, max4.y, max4.z}); \
+    }
+
+    if (axis == 0) {
+        BUILD_OVER(x);
+    } else if (axis == 1) {
+        BUILD_OVER(y);
+    } else {
+        BUILD_OVER(z);
+    }
+    __syncthreads();
+
+    // Shared memory now contains an accurate view of all the bins processed by
+    // this threadblock. Let's merge them into the global view.
+    if (threadIdx.x < NUM_BINS) {
+        TriBin& sBin = bins[threadIdx.x];
+        TriBin& gBin = u.bins[queueId*NUM_BINS + threadIdx.x];
+        atomicAdd(&gBin.count, sBin.count);
+        atomic_fmin_ew3(&gBin.min, sBin.min);
+        atomic_fmax_ew3(&gBin.max, sBin.max);
+    }
 }
 
+// This kernel expects one threadblock for each filled queue entry.
+// There are 2^level queue entries at that level.
+__global__ __launch_bounds__(WARP_THREADS) 
+void horizontalScan(DeviceUniforms u) {
+    const TriBin* bins = &u.bins[blockIdx.x*NUM_BINS];
+
+    // Each thread evaluates a different split. A lot of threads are unused
+    // since we only have NUM_BINS-1 splits to evaluate.
+    TriSplit split = {};
+    uint splitId = 1 + threadIdx.x;
+
+    for (uint binId = 0; binId < NUM_BINS; ++binId) {
+        const TriBin& bin = bins[binId];
+        if (binId < splitId) {
+            split.inLeft += bin.count;
+            split.ltMin = fmin3(split.ltMin, bin.min);
+            split.ltMax = fmax3(split.ltMax, bin.max);
+        } else {
+            split.inRight += bin.count;
+            split.rtMin = fmin3(split.rtMin, bin.min);
+            split.rtMax = fmax3(split.rtMax, bin.max);
+        }
+    }
+
+    // The fminf converts NAN to infinite cost
+    float cost = fminf(split.heuristic(), INFINITY);
+    float minCost = cost;
+
+    // Identify minimum cost across threads
+    // (We assume there are only 32 threads in the threadblock)
+    for (uint buddy = 1; buddy < WARP_THREADS; buddy *= 2) {
+        float buddyMinCost = __shfl_sync(
+            ~0, minCost, threadIdx.x + buddy, WARP_THREADS);
+        minCost = fminf(minCost, buddyMinCost);
+    }
+
+    // This ballot trickery guarantees that exactly one thread writes to
+    // u.splits, even if multiple threads have an identical min cost.
+    uint hasMinCost = __ballot_sync(~0, cost == minCost);
+    if (threadIdx.x == __ffs(hasMinCost)) {
+        u.splits[blockIdx.x] = split;
+    }
+}
+
+__global__ void horizontalPartition(DeviceUniforms u, uint level) {
+    uint mask = (1u << level) - 1u;
+    uint queueId = mask & blockIdx.x;
+    uint nodeId = mask + queueId;
+    CompressedNode& node = u.nodes[nodeId];
+    if (node.isLeaf()) {
+        return;
+    }
+
+    // The index of this thread within all threads assigned to this node.
+    uint localBlockId = blockIdx.x >> level;
+    uint localBlocks = gridDim.x >> level;
+    uint localThreadId = localBlockId*blockDim.x + threadIdx.x;
+    uint localThreads = localBlocks*blockDim.x;
+
+    // Identify binning axis.
+    // The node hasn't been updated yet, so this is still the centroid bounds.
+    float axisLength, axisStart;
+    int axis = getLongestAxis(node.min, node.max, axisLength, axisStart);
+}
+
+#if 0
 // dynamic parallelism: why write our own load balancing code when we could just use the GPU's firmware?
 template<const int N>
 __device__ void partitionTris(const DeviceUniforms& u, Node& leftChild, Node& rightChild, int start, int end, int axis, float pivot) {
@@ -498,7 +715,7 @@ void buildTree(DeviceUniforms u, int nodeId) {
 
     // TODO: CRASHES AFTER THIS
     return;
-    
+
     partitionTris<N>(u, leftChild, rightChild, node.triStart, node.triEnd, axis, splitPos);
 
     // Spawn children using dynamic parallelism
@@ -510,6 +727,7 @@ void buildTree(DeviceUniforms u, int nodeId) {
         cudaStreamDestroy(stream);
     }
 }
+#endif
 
 
 std::shared_ptr<CudaBVH> build_cuda_bvh(
@@ -524,7 +742,9 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     cudaMalloc((float4**)&u.triMaxs, numTris*sizeof(float4));
     cudaMalloc((float4**)&u.triMinsIdsAux, numTris*sizeof(float4));
     cudaMalloc((float4**)&u.triMaxsAux, numTris*sizeof(float4));
-    cudaMalloc((Node**)&u.nodes, (2*numTris-1)*sizeof(Node));
+    cudaMalloc((CompressedNode**)&u.nodes, (2*numTris-1)*sizeof(CompressedNode));
+    cudaMalloc((TriBin**)&u.bins, QUEUE_SIZE*NUM_BINS*sizeof(TriBin));
+    cudaMalloc((TriSplit**)&u.splits, QUEUE_SIZE*sizeof(TriSplit));
 
     // Copy triangles into device memory
     cudaMemcpy(
@@ -534,36 +754,49 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaMemcpyHostToDevice);
 
     // Copy root node into device memory
-    Node root(0, numTris);
+    CompressedNode root(0, numTris);
     cudaMemcpy(
         u.nodes,
         &root,
-        sizeof(Node),
+        sizeof(CompressedNode),
         cudaMemcpyHostToDevice);
     
     // Compute triangle AABBs
-    setupTris<<<NP2(numTris, OPTIMAL_WIDTH), OPTIMAL_WIDTH>>>(u);
+    setupTris<<<NP2(numTris, OPT_THREADS), OPT_THREADS>>>(u);
 
-    // Build tree (vertical parallelism only for now)
-    buildTree<OPTIMAL_WIDTH><<<1, OPTIMAL_WIDTH>>>(u, 0);
+    // Create profiling events
+    cudaEvent_t horizStart, horizEnd;
+    cudaEventCreate(&horizStart);
+    cudaEventCreate(&horizEnd);
+
+    // Horizontal binning
+    cudaEventRecord(horizStart);
+    for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
+        horizontalPrebin<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
+        horizontalScan<<<(1 << hLevel), WARP_THREADS>>>(u);
+        break;
+    }
+    cudaEventRecord(horizEnd);
 
     // Synchronize
     cudaDeviceSynchronize();
+
+    // Print stats
+    float horizTimeMs = 0.0f;
+    cudaEventElapsedTime(&horizTimeMs, horizStart, horizEnd);
+    printf("GPU elapsed: %f ms\n", horizTimeMs);
 
     // Copy device root node back onto host for debugging purposes
     cudaMemcpy(
         &root,
         u.nodes,
-        sizeof(Node),
+        sizeof(CompressedNode),
         cudaMemcpyDeviceToHost);
     
     // Debug info
     printf("Geometry: [%f, %f, %f] to [%f, %f, %f]\n", 
-        root.tMin.x, root.tMin.y, root.tMin.z,
-        root.tMax.x, root.tMax.y, root.tMax.z);
-    printf("Centroid: [%f, %f, %f] to [%f, %f, %f]\n",
-        root.cMin.x, root.cMin.y, root.cMin.z,
-        root.cMax.x, root.cMax.y, root.cMax.z);
+        root.min.x, root.min.y, root.min.z,
+        root.max.x, root.max.y, root.max.z);
 
     return std::make_shared<CudaBVH>(u);
 }
