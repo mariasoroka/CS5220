@@ -30,7 +30,7 @@ float get_area(const AABB &aabb);
 /*Function to merge two bounding boxes*/
 AABB merge(const AABB &aabb1, const AABB &aabb2);
 
-void in_place_merge(AABB &aabb1, const AABB &aabb2);
+void operator+=(AABB &aabb1, const AABB &aabb2);
 
 /*Function computing bounding box of a triangle*/
 AABB triangle_aabb(const triangle &t);

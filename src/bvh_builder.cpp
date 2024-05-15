@@ -329,21 +329,22 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     }
 
 
-#pragma omp declare reduction(                             \
-                            mergeBbox :                     \
-                            AABB :   \
-                            in_place_merge(omp_out, omp_in)      \
-                            )                             \
+// #pragma omp declare reduction(                             \
+//                             mergeBbox :                     \
+//                             AABB :   \
+//                             operator+=(omp_out, omp_in)      \
+//                             )                             \
+
     // compute the bounding box of the scene
-    AABB scene_bounds;
-    #pragma omp parallel for reduction(mergeBbox:scene_bounds)
-        for (int i = 0; i < num_triangles; i++)
-        {
-            scene_bounds = merge(scene_bounds, triangle_bounds[i]);
-        }
+    // AABB scene_bounds;
+    // #pragma omp parallel for reduction(mergeBbox:scene_bounds)
+    //     for (int i = 0; i < num_triangles; i++)
+    //     {
+    //         scene_bounds += triangle_bounds[i];
+    //     }
 
 
-
+    AABB scene_bounds = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
     // variables necessary for horizontal parallellization
     // SplitNode **partial_splits = new SplitNode *[n_bins]; // can probably declare this earlier
     // int **num_n0 = new int *[n_bins];
