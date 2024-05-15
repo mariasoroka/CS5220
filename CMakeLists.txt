@@ -12,6 +12,7 @@ target_compile_features(build_tree PUBLIC cxx_std_20)
 target_compile_features(build_tree PUBLIC cuda_std_20)
 set_target_properties(build_tree PROPERTIES CUDA_ARCHITECTURES native)
 set_target_properties(build_tree PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_compile_options(build_tree PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_include_directories(build_tree PRIVATE
     ${CMAKE_SOURCE_DIR}/eigen 
     ${CMAKE_SOURCE_DIR}/libigl/include)

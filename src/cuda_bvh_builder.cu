@@ -300,6 +300,18 @@ __device__ inline int getLongestAxis(float3 min, float3 max, float& length, floa
     return axis;
 }
 
+// Each threadblock clears the bins for one queue entry.
+__global__ void horizontalClearBins(DeviceUniforms u) {
+    uint queueId = blockIdx.x;
+    TriBin* bins = &u.bins[queueId*NUM_BINS];
+    if (threadIdx.x < NUM_BINS) {
+        TriBin& bin = bins[threadIdx.x];
+        bin.count = 0;
+        bin.min = {+INFINITY, +INFINITY, +INFINITY};
+        bin.max = {-INFINITY, -INFINITY, -INFINITY};
+    }
+}
+
 __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
     // Level 0: All threadblocks process node 0.
     // Level 1: The first half of threadblocks process node 1+0,
@@ -389,10 +401,20 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
 // There are 2^level queue entries at that level.
 __global__ __launch_bounds__(WARP_THREADS) 
 void horizontalScan(DeviceUniforms u, uint level) {
-    uint mask = (1u << level) - 1u;
     uint queueId = blockIdx.x;
+    uint mask = (1u << level) - 1u;
     uint nodeId = mask + queueId;
     if (u.nodes[nodeId].isLeaf()) {
+        // This kernel is in charge of setting up the child nodes, so we'll need
+        // to ensure the child nodes are treated as leaves and skipped.
+        if (threadIdx.x == 0) {
+            Node& leftChild = u.nodes[2*nodeId+1];
+            leftChild.triStart = 0;
+            leftChild.triEnd = 0;
+            Node& rightChild = u.nodes[2*nodeId+2];
+            rightChild.triStart = 0;
+            rightChild.triEnd = 0;
+        }
         return;
     }
 
@@ -478,7 +500,7 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
 
     // Identify split pos along the split axis
-    float splitPos = axisStart+axisLength*(node.splitId/NUM_BINS);
+    float splitPos = axisStart+axisLength*(node.splitId/float(NUM_BINS));
 
     // We build child centroid bounds while iterating, too
     float3 lcMin, lcMax, rcMin, rcMax;
@@ -895,6 +917,7 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     // Horizontal binning
     cudaEventRecord(horizStart);
     for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
+        horizontalClearBins<<<(1 << hLevel), WARP_THREADS>>>(u);
         horizontalPrebin<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
         horizontalScan<<<(1 << hLevel), WARP_THREADS>>>(u, hLevel);
         horizontalPartition<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
@@ -921,9 +944,6 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     printf("Geometry: [%f, %f, %f] to [%f, %f, %f]\n", 
         root.tMin.x, root.tMin.y, root.tMin.z,
         root.tMax.x, root.tMax.y, root.tMax.z);
-    printf("Centroid: [%f, %f, %f] to [%f, %f, %f]\n",
-        root.cMin.x, root.cMin.y, root.cMin.z,
-        root.cMax.x, root.cMax.y, root.cMax.z);
 
     return std::make_shared<CudaBVH>(u);
 }
