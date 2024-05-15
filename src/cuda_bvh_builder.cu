@@ -124,21 +124,27 @@ __device__ inline float halfSurfaceArea(float3 min, float3 max) {
 //
 // NOTE: The split axis can be computed implicitly by taking the maximum
 // dimension from the triangle centroid bounds.
-struct alignas(32) CompressedNode {
+struct alignas(64) Node {
     // The index of the first triangle in this node.
     uint triStart;
     // One past the index of the last triangle in this node.
     uint triEnd;
 
-    // AABB bounds. Before the node is built, these are centroid bounds.
-    // After the node is processed, these are the actual geometric bounds.
-    float3 min, max;
+    // Split ID
+    uint splitId;
+
+    // Centroid and triangle AABB bounds.
+    float3 cMin, cMax;
+    float3 tMin, tMax;
 
     // Constructs an empty node that stores from _triStart to _triEnd triangles
-    constexpr CompressedNode(int _triStart, int _triEnd)
+    constexpr Node(int _triStart, int _triEnd)
       : triStart(_triStart), triEnd(_triEnd),
-        min { +INFINITY, +INFINITY, +INFINITY },
-        max { -INFINITY, -INFINITY, -INFINITY }
+        splitId(~0),
+        cMin { +INFINITY, +INFINITY, +INFINITY },
+        cMax { -INFINITY, -INFINITY, -INFINITY },
+        tMin { +INFINITY, +INFINITY, +INFINITY },
+        tMax { -INFINITY, -INFINITY, -INFINITY }
     {}
     
     __device__ inline uint count() const {
@@ -151,7 +157,7 @@ struct alignas(32) CompressedNode {
     }
 };
 
-static_assert(sizeof(CompressedNode) == 32);
+static_assert(sizeof(Node) == 64);
 
 
 struct TriBin {
@@ -165,12 +171,12 @@ struct TriBin {
     {}
 };
 
-struct TriSplit {
+struct TriSplitStats {
     uint inLeft, inRight;
     float3 ltMin, ltMax;
     float3 rtMin, rtMax;
 
-    __device__ constexpr TriSplit()
+    __device__ constexpr TriSplitStats()
       : inLeft(0), inRight(0),
         ltMin { +INFINITY, +INFINITY, +INFINITY },
         ltMax { -INFINITY, -INFINITY, -INFINITY },
@@ -202,19 +208,15 @@ struct DeviceUniforms {
 
     // Auxiliary arrays used as scratch space during partitioning
     float4* __restrict__ triMinsIdsAux;
-    float4* __restrict__ triMaxsAux;
+    float4* __restrict__ triMaxsLeftsAux;
 
     // Node array. Equal to 2N-1 where N is the number of triangles.
-    CompressedNode* __restrict__ nodes;
+    Node* __restrict__ nodes;
 
     // Global bins for the horizontal binning phase.
     // There are QUEUE_SIZE * NUM_BINS of these.
     // Indexed by queue ID, then by bin index.
     TriBin* __restrict__ bins;
-
-    // Global splits to store the selected splits.
-    // Indexed by queue ID.
-    TriSplit* __restrict__ splits;
 };
 
 class CudaBVH {
@@ -226,6 +228,10 @@ public:
         cudaFree(_u.tris);
         cudaFree(_u.triMinsIds);
         cudaFree(_u.triMaxs);
+        cudaFree(_u.triMinsIdsAux);
+        cudaFree(_u.triMaxsLeftsAux);
+        cudaFree(_u.nodes);
+        cudaFree(_u.bins);
     }
 private:
     DeviceUniforms _u;
@@ -263,9 +269,11 @@ __global__ void setupTris(DeviceUniforms u) {
     };
 
     // This is a lot of atomics. Hopefully this does not become a bottleneck.
-    CompressedNode& node = u.nodes[0];
-    atomic_fmin_ew3(&node.min, centroid);
-    atomic_fmax_ew3(&node.max, centroid);
+    Node& node = u.nodes[0];
+    atomic_fmin_ew3(&node.tMin, {minId.x, minId.y, minId.z});
+    atomic_fmax_ew3(&node.tMax, {max.x, max.y, max.z});
+    atomic_fmin_ew3(&node.cMin, centroid);
+    atomic_fmax_ew3(&node.cMax, centroid);
 }
 
 // Returns the index of the longest axis in the AABB defined by min and max.
@@ -301,7 +309,7 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
     uint mask = (1u << level) - 1u;
     uint queueId = mask & blockIdx.x;
     uint nodeId = mask + queueId;
-    CompressedNode& node = u.nodes[nodeId];
+    Node& node = u.nodes[nodeId];
     if (node.isLeaf()) {
         return;
     }
@@ -314,12 +322,17 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
 
     // Debug stats
     if (localThreadId == 0 && level <= 2) {
-        printf("%*s↪ node %u: %i tris\n", level, "", nodeId, node.count());
+        printf("%*s↪ node %u: %i tris, [%.2f,%2.f,%.2f][%.2f,%2.f,%2.f] centroid, [%.2f,%.2f,%.2f][%.2f,%.2f,%.2f] geometry\n", 
+            level, "", nodeId, node.count(),
+            node.cMin.x, node.cMin.y, node.cMin.z, 
+            node.cMax.x, node.cMax.y, node.cMax.z,
+            node.tMin.x, node.tMin.y, node.tMin.z, 
+            node.tMax.x, node.tMax.y, node.tMax.z);
     }
 
     // Identify binning axis
     float axisLength, axisStart;
-    int axis = getLongestAxis(node.min, node.max, axisLength, axisStart);
+    int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
 
     // Precompute k1 constant from Wald07
     constexpr float almostOne = 1.0f - 10.0f*FLT_EPSILON;
@@ -359,6 +372,7 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
         BUILD_OVER(z);
     }
     __syncthreads();
+#undef BUILD_OVER
 
     // Shared memory now contains an accurate view of all the bins processed by
     // this threadblock. Let's merge them into the global view.
@@ -374,29 +388,36 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
 // This kernel expects one threadblock for each filled queue entry.
 // There are 2^level queue entries at that level.
 __global__ __launch_bounds__(WARP_THREADS) 
-void horizontalScan(DeviceUniforms u) {
-    const TriBin* bins = &u.bins[blockIdx.x*NUM_BINS];
+void horizontalScan(DeviceUniforms u, uint level) {
+    uint mask = (1u << level) - 1u;
+    uint queueId = blockIdx.x;
+    uint nodeId = mask + queueId;
+    if (u.nodes[nodeId].isLeaf()) {
+        return;
+    }
+
+    const TriBin* bins = &u.bins[queueId*NUM_BINS];
 
     // Each thread evaluates a different split. A lot of threads are unused
     // since we only have NUM_BINS-1 splits to evaluate.
-    TriSplit split = {};
+    TriSplitStats stats = {};
     uint splitId = 1 + threadIdx.x;
 
     for (uint binId = 0; binId < NUM_BINS; ++binId) {
         const TriBin& bin = bins[binId];
         if (binId < splitId) {
-            split.inLeft += bin.count;
-            split.ltMin = fmin3(split.ltMin, bin.min);
-            split.ltMax = fmax3(split.ltMax, bin.max);
+            stats.inLeft += bin.count;
+            stats.ltMin = fmin3(stats.ltMin, bin.min);
+            stats.ltMax = fmax3(stats.ltMax, bin.max);
         } else {
-            split.inRight += bin.count;
-            split.rtMin = fmin3(split.rtMin, bin.min);
-            split.rtMax = fmax3(split.rtMax, bin.max);
+            stats.inRight += bin.count;
+            stats.rtMin = fmin3(stats.rtMin, bin.min);
+            stats.rtMax = fmax3(stats.rtMax, bin.max);
         }
     }
 
     // The fminf converts NAN to infinite cost
-    float cost = fminf(split.heuristic(), INFINITY);
+    float cost = fminf(stats.heuristic(), INFINITY);
     float minCost = cost;
 
     // Identify minimum cost across threads
@@ -411,7 +432,29 @@ void horizontalScan(DeviceUniforms u) {
     // u.splits, even if multiple threads have an identical min cost.
     uint hasMinCost = __ballot_sync(~0, cost == minCost);
     if (threadIdx.x == __ffs(hasMinCost)) {
-        u.splits[blockIdx.x] = split;
+        Node& node = u.nodes[nodeId];
+        node.splitId = splitId;
+
+        // Mostly-initialize child nodes. The partitioning kernel still needs to
+        // compute centroid bounds, and the prebinning kernel in the next
+        // iteration needs to compute split IDs.
+        Node& leftChild = u.nodes[2*nodeId+1];
+        leftChild.triStart = node.triStart;
+        leftChild.triEnd = node.triStart + stats.inLeft;
+        leftChild.splitId = ~0;
+        leftChild.cMin = {+INFINITY, +INFINITY, +INFINITY};
+        leftChild.cMax = {-INFINITY, -INFINITY, -INFINITY};
+        leftChild.tMin = stats.ltMin;
+        leftChild.tMax = stats.ltMax;
+
+        Node& rightChild = u.nodes[2*nodeId+2];
+        rightChild.triStart = leftChild.triEnd;
+        rightChild.triEnd = node.triEnd;
+        rightChild.splitId = ~0;
+        rightChild.cMin = {+INFINITY, +INFINITY, +INFINITY};
+        rightChild.cMax = {-INFINITY, -INFINITY, -INFINITY};
+        rightChild.tMin = stats.rtMin;
+        rightChild.tMax = stats.rtMax;
     }
 }
 
@@ -419,7 +462,7 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     uint mask = (1u << level) - 1u;
     uint queueId = mask & blockIdx.x;
     uint nodeId = mask + queueId;
-    CompressedNode& node = u.nodes[nodeId];
+    Node& node = u.nodes[nodeId];
     if (node.isLeaf()) {
         return;
     }
@@ -431,9 +474,90 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     uint localThreads = localBlocks*blockDim.x;
 
     // Identify binning axis.
-    // The node hasn't been updated yet, so this is still the centroid bounds.
     float axisLength, axisStart;
-    int axis = getLongestAxis(node.min, node.max, axisLength, axisStart);
+    int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
+
+    // Identify split pos along the split axis
+    float splitPos = axisStart+axisLength*(node.splitId/NUM_BINS);
+
+    // We build child centroid bounds while iterating, too
+    float3 lcMin, lcMax, rcMin, rcMax;
+    lcMin = rcMin = { +INFINITY, +INFINITY, +INFINITY };
+    lcMax = rcMax = { -INFINITY, -INFINITY, -INFINITY };
+
+    // Counts how many triangles processed by THIS THREAD
+    // fall into the left or right children.
+    uint myLeft = 0;
+    uint myRight = 0;
+
+#define BUILD_OVER(cmp) \
+    for (uint triId = node.triStart + localThreadId; \
+              triId < node.triEnd; \
+              triId += localThreads) { \
+        float4 minId4 = u.triMinsIds[triId]; \
+        float4 maxLeft4 = u.triMaxs[triId]; \
+        float3 centroid = { \
+            0.5f * (minId4.x + maxLeft4.x), \
+            0.5f * (minId4.y + maxLeft4.y), \
+            0.5f * (minId4.z + maxLeft4.z) \
+        }; \
+        if (centroid. cmp < splitPos) { \
+            lcMin = fmin3(lcMin, centroid); \
+            lcMax = fmax3(lcMax, centroid); \
+            maxLeft4.w = -1.0f; \
+            myLeft += 1; \
+        } else { \
+            rcMin = fmin3(rcMin, centroid); \
+            rcMax = fmax3(rcMax, centroid); \
+            maxLeft4.w = 1.0f; \
+            myRight += 1; \
+        } \
+        u.triMinsIdsAux[triId] = minId4; \
+        u.triMaxsLeftsAux[triId] = maxLeft4; \
+    }
+
+    if (axis == 0) {
+        BUILD_OVER(x);
+    } else if (axis == 1) {
+        BUILD_OVER(y);
+    } else {
+        BUILD_OVER(z);
+    }
+#undef BUILD_OVER
+
+    // Reduce values over threadblock
+    __shared__ uint tbLeft;
+    __shared__ uint tbRight;
+    __shared__ float3 tbLcMin; 
+    __shared__ float3 tbLcMax;
+    __shared__ float3 tbRcMin;
+    __shared__ float3 tbRcMax;
+    if (threadIdx.x == 0) {
+       tbLeft = tbRight = 0; 
+       tbLcMin = tbRcMin = {+INFINITY, +INFINITY, +INFINITY};
+       tbLcMax = tbRcMax = {-INFINITY, -INFINITY, -INFINITY};
+    }
+    __syncthreads();
+
+    atomicAdd_block(&tbLeft, myLeft);
+    atomicAdd_block(&tbRight, myRight);
+    atomic_fmin_ew3_block(&tbLcMin, lcMin);
+    atomic_fmax_ew3_block(&tbLcMax, lcMax);
+    atomic_fmin_ew3_block(&tbRcMin, rcMin);
+    atomic_fmax_ew3_block(&tbRcMax, rcMax);
+    __syncthreads();
+
+    // Reduce centroid AABBs for child nodes,
+    // and globally allocate space for this threadblock's left tris
+    if (threadIdx.x == 0) {
+        Node& leftChild = u.nodes[2*nodeId+1];
+        atomic_fmin_ew3(&leftChild.cMin, tbLcMin);
+        atomic_fmax_ew3(&leftChild.cMax, tbLcMax);
+
+        Node& rightChild = u.nodes[2*nodeId+2];
+        atomic_fmin_ew3(&rightChild.cMin, tbRcMin);
+        atomic_fmax_ew3(&rightChild.cMax, tbRcMax);
+    }
 }
 
 #if 0
@@ -741,10 +865,9 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     cudaMalloc((float4**)&u.triMinsIds, numTris*sizeof(float4));
     cudaMalloc((float4**)&u.triMaxs, numTris*sizeof(float4));
     cudaMalloc((float4**)&u.triMinsIdsAux, numTris*sizeof(float4));
-    cudaMalloc((float4**)&u.triMaxsAux, numTris*sizeof(float4));
-    cudaMalloc((CompressedNode**)&u.nodes, (2*numTris-1)*sizeof(CompressedNode));
+    cudaMalloc((float4**)&u.triMaxsLeftsAux, numTris*sizeof(float4));
+    cudaMalloc((Node**)&u.nodes, (2*numTris-1)*sizeof(Node));
     cudaMalloc((TriBin**)&u.bins, QUEUE_SIZE*NUM_BINS*sizeof(TriBin));
-    cudaMalloc((TriSplit**)&u.splits, QUEUE_SIZE*sizeof(TriSplit));
 
     // Copy triangles into device memory
     cudaMemcpy(
@@ -754,11 +877,11 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaMemcpyHostToDevice);
 
     // Copy root node into device memory
-    CompressedNode root(0, numTris);
+    Node root(0, numTris);
     cudaMemcpy(
         u.nodes,
         &root,
-        sizeof(CompressedNode),
+        sizeof(Node),
         cudaMemcpyHostToDevice);
     
     // Compute triangle AABBs
@@ -773,7 +896,8 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     cudaEventRecord(horizStart);
     for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
         horizontalPrebin<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
-        horizontalScan<<<(1 << hLevel), WARP_THREADS>>>(u);
+        horizontalScan<<<(1 << hLevel), WARP_THREADS>>>(u, hLevel);
+        horizontalPartition<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
         break;
     }
     cudaEventRecord(horizEnd);
@@ -790,13 +914,16 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     cudaMemcpy(
         &root,
         u.nodes,
-        sizeof(CompressedNode),
+        sizeof(Node),
         cudaMemcpyDeviceToHost);
     
     // Debug info
     printf("Geometry: [%f, %f, %f] to [%f, %f, %f]\n", 
-        root.min.x, root.min.y, root.min.z,
-        root.max.x, root.max.y, root.max.z);
+        root.tMin.x, root.tMin.y, root.tMin.z,
+        root.tMax.x, root.tMax.y, root.tMax.z);
+    printf("Centroid: [%f, %f, %f] to [%f, %f, %f]\n",
+        root.cMin.x, root.cMin.y, root.cMin.z,
+        root.cMax.x, root.cMax.y, root.cMax.z);
 
     return std::make_shared<CudaBVH>(u);
 }
