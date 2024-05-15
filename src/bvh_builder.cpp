@@ -318,16 +318,31 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     int *triangle_idxs = new int[num_triangles];
 
     // compute the bounds, centers and fill the buffer triangle_idxs with indices
+#pragma omp parallel for 
+    for (int i = 0; i < num_triangles; i++) {
 
-    std::transform(triangles, triangles + num_triangles, triangle_bounds, triangle_aabb);
+        triangle_bounds[i] = triangle_aabb(triangles[i]);
 
-    std::transform(triangles, triangles + num_triangles, triangle_centers, get_center);
+        triangle_centers[i] = get_center(triangles[i]);
 
-    std::iota(triangle_idxs, triangle_idxs + num_triangles, 0);
+        triangle_idxs[i] = i;
+    }
 
+
+#pragma omp declare reduction(                             \
+                            mergeBbox :                     \
+                            AABB :   \
+                            in_place_merge(omp_out, omp_in)      \
+                            )                             \
     // compute the bounding box of the scene
+    AABB scene_bounds;
+    #pragma omp parallel for reduction(mergeBbox:scene_bounds)
+        for (int i = 0; i < num_triangles; i++)
+        {
+            scene_bounds = merge(scene_bounds, triangle_bounds[i]);
+        }
 
-    AABB scene_bounds = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
+
 
     // variables necessary for horizontal parallellization
     // SplitNode **partial_splits = new SplitNode *[n_bins]; // can probably declare this earlier
