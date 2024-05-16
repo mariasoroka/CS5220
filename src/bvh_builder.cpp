@@ -11,7 +11,7 @@
 
 #include <cassert>
 
-#define NUM_THREADS 16
+#define NUM_THREADS 32
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
@@ -333,22 +333,21 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
 
 
-// #pragma omp declare reduction(                             \
-//                             mergeBbox :                     \
-//                             AABB :   \
-//                             operator+=(omp_out, omp_in)      \
-//                             )                             \
+#pragma omp declare reduction(                             \
+                            mergeBbox :                     \
+                            AABB :   \
+                            operator+=(omp_out, omp_in)      \
+                            )                             \
 
     // compute the bounding box of the scene
-    // AABB scene_bounds;
-    // #pragma omp parallel for reduction(mergeBbox:scene_bounds)
-    //     for (int i = 0; i < num_triangles; i++)
-    //     {
-    //         scene_bounds += triangle_bounds[i];
-    //     }
+    AABB scene_bounds;
+#pragma omp parallel for reduction(mergeBbox:scene_bounds)
+        for (int i = 0; i < num_triangles; i++)
+        {
+            scene_bounds += triangle_bounds[i];
+        }
 
-
-    AABB scene_bounds = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
+    // AABB scene_bounds_test = std::reduce(triangle_bounds, triangle_bounds + num_triangles, AABB(), merge);
     // variables necessary for horizontal parallellization
     // SplitNode **partial_splits = new SplitNode *[n_bins]; // can probably declare this earlier
     // int **num_n0 = new int *[n_bins];
@@ -361,20 +360,20 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     int **num_n1 = new int *[NUM_THREADS];
     AABB **AABB_n0 = new AABB *[NUM_THREADS];
     AABB **AABB_n1 = new AABB *[NUM_THREADS];
-    for (int i = 0; i < NUM_THREADS; ++i)
-    {
-        // partial_splits[i] = new SplitNode[NUM_THREADS];
-        // num_n0[i] = new int[NUM_THREADS];
-        // num_n1[i] = new int[NUM_THREADS];
-        // AABB_n0[i] = new AABB[NUM_THREADS];
-        // AABB_n1[i] = new AABB[NUM_THREADS];
+    // for (int i = 0; i < NUM_THREADS; ++i)
+    // {
+    //     // partial_splits[i] = new SplitNode[NUM_THREADS];
+    //     // num_n0[i] = new int[NUM_THREADS];
+    //     // num_n1[i] = new int[NUM_THREADS];
+    //     // AABB_n0[i] = new AABB[NUM_THREADS];
+    //     // AABB_n1[i] = new AABB[NUM_THREADS];
 
-        partial_splits[i] = new SplitNode[n_bins];
-        num_n0[i] = new int[n_bins];
-        num_n1[i] = new int[n_bins];
-        AABB_n0[i] = new AABB[n_bins];
-        AABB_n1[i] = new AABB[n_bins];
-    }
+    //     partial_splits[i] = new SplitNode[n_bins];
+    //     num_n0[i] = new int[n_bins];
+    //     num_n1[i] = new int[n_bins];
+    //     AABB_n0[i] = new AABB[n_bins];
+    //     AABB_n1[i] = new AABB[n_bins];
+    // }
     float *costs = new float[n_bins];
 
     // counters for number of nodes and leaves
@@ -408,6 +407,11 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
         {
             // each thread works on a subsection of triangles
             int thread_idx = omp_get_thread_num();
+            partial_splits[thread_idx] = new SplitNode[n_bins];
+            num_n0[thread_idx] = new int[n_bins];
+            num_n1[thread_idx] = new int[n_bins];
+            AABB_n0[thread_idx] = new AABB[n_bins];
+            AABB_n1[thread_idx] = new AABB[n_bins];
             int curr_num_triangles = node.i1 - node.i0;
             int n_per_thread = (curr_num_triangles + NUM_THREADS) / NUM_THREADS;
             int start = node.i0 + min(thread_idx * n_per_thread, curr_num_triangles);
@@ -512,18 +516,31 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
     if (queue.size() == NUM_THREADS)
     {   
         std::vector<BVH::LevelInfo> threadLevelInfos[NUM_THREADS];
+        int *local_num_nodes = new int[NUM_THREADS];
+        int *local_num_leaves = new int[NUM_THREADS];
+        BVHNode **local_nodes = new BVHNode *[NUM_THREADS];
+        BVHNode **local_leaves = new BVHNode *[NUM_THREADS];
+
 
 // vertical parallelization
-#pragma omp parallel shared(bvh) shared(node_idx) shared(leaf_idx) shared(threadLevelInfos)
+#pragma omp parallel shared(bvh) shared(node_idx) shared(leaf_idx) shared(threadLevelInfos) shared(local_num_nodes) shared(local_num_leaves) shared(local_nodes) shared(local_leaves) 
         {
             int curr_node_idx;
             int curr_leaf_idx;
             int thread_idx = omp_get_thread_num();
+
+            partial_splits[thread_idx] = new SplitNode[n_bins];
+            local_num_nodes[thread_idx] = 0;
+            local_num_leaves[thread_idx] = 0;
+            
             // std::cout << "thread  " << thread_idx << " is working" << std::endl;
             //  int thread_idx = 1;
             threadLevelInfos[thread_idx] = bvh.levelInfos;
 
             StackNode root = queue[thread_idx];
+            root.node_idx = 0;
+            local_nodes[thread_idx] = new BVHNode[2 * (root.i1 - root.i0)];
+            local_leaves[thread_idx] = new BVHNode[root.i1 - root.i0];
             // node_idx++;
             StackNode stack[64];
             int stack_idx = 0;
@@ -562,20 +579,21 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
                         // atomic
 
-#pragma omp atomic capture
-                        curr_leaf_idx = ++leaf_idx;
+// #pragma omp atomic capture
 
-                        bvh.leaves[curr_leaf_idx].aabb = child.aabb;
+                        (local_leaves[thread_idx])[local_num_leaves[thread_idx]].aabb = child.aabb;
 
-                        bvh.leaves[curr_leaf_idx].is_leaf = true;
+                        (local_leaves[thread_idx])[local_num_leaves[thread_idx]].is_leaf = true;
 
-                        bvh.leaves[curr_leaf_idx].num_triangles = child.i1 - child.i0;
+                        (local_leaves[thread_idx])[local_num_leaves[thread_idx]].num_triangles = child.i1 - child.i0;
 
-                        bvh.leaves[curr_leaf_idx].triangle_indices = new int[bvh.leaves[curr_leaf_idx].num_triangles];
+                        (local_leaves[thread_idx])[local_num_leaves[thread_idx]].triangle_indices = new int[(local_leaves[thread_idx])[local_num_leaves[thread_idx]].num_triangles];
 
-                        std::copy(triangle_idxs + child.i0, triangle_idxs + child.i1, bvh.leaves[curr_leaf_idx].triangle_indices);
+                        std::copy(triangle_idxs + child.i0, triangle_idxs + child.i1, (local_leaves[thread_idx])[local_num_leaves[thread_idx]].triangle_indices);
 
-                        bvh.nodes[node.node_idx].children[i] = &bvh.leaves[curr_leaf_idx];
+                        (local_nodes[thread_idx])[node.node_idx].children[i] = &(local_leaves[thread_idx])[local_num_leaves[thread_idx]];
+                        local_num_leaves[thread_idx]++;
+
                     }
 
                     // if the child is not a leaf, add it to the bvh.nodes array and push it to the stack
@@ -584,17 +602,16 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
                     {
 
-#pragma omp atomic capture
-                        curr_node_idx = ++node_idx;
+// #pragma omp atomic capture
 
-                        bvh.nodes[curr_node_idx].aabb = child.aabb;
+                        (local_nodes[thread_idx])[local_num_nodes[thread_idx]].aabb = child.aabb;
 
-                        bvh.nodes[curr_node_idx].is_leaf = false;
+                        (local_nodes[thread_idx])[local_num_nodes[thread_idx]].is_leaf = false;
 
-                        stack[stack_idx] = {curr_node_idx, child.aabb, child.i0, child.i1, child.level};
+                        stack[stack_idx] = {local_num_nodes[thread_idx], child.aabb, child.i0, child.i1, child.level};
 
-                        bvh.nodes[node.node_idx].children[i] = &bvh.nodes[curr_node_idx];
-
+                        (local_nodes[thread_idx])[node.node_idx].children[i] = &(local_nodes[thread_idx])[local_num_nodes[thread_idx]];
+                        local_num_nodes[thread_idx]++;
                         stack_idx++;
                     }
                 }
@@ -609,6 +626,65 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
                 info.splits += 1;
                 info.time += std::chrono::duration<float>(end-start).count();
             }
+        }
+
+        int *local_offset_nodes = new int[NUM_THREADS + 1];
+        int *local_offset_leaves = new int[NUM_THREADS + 1];
+        local_offset_nodes[0] = 0;
+        local_offset_leaves[0] = 0;
+        std::partial_sum(local_num_nodes, local_num_nodes + NUM_THREADS, local_offset_nodes + 1);
+        std::partial_sum(local_num_leaves, local_num_leaves + NUM_THREADS, local_offset_leaves + 1);
+
+        // for(int i = 0; i < NUM_THREADS; i++){
+        //     std::cout << "Leaves offsets:" << local_offset_leaves[i] << " " << local_num_leaves[i] << std::endl;
+        //     std::cout << "Nodes offsets:" << local_offset_nodes[i] << " " << local_num_nodes[i] << std::endl;
+        // }
+
+
+#pragma omp parallel shared(bvh) shared(node_idx) shared(leaf_idx) shared(threadLevelInfos) shared(local_num_nodes) shared(local_num_leaves) shared(local_nodes) shared(local_leaves) shared(local_offset_nodes) shared(local_offset_leaves)
+        {
+            int thread_idx = omp_get_thread_num();
+            for(int i = 0; i < local_num_nodes[thread_idx]; i++) {
+                bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].aabb = local_nodes[thread_idx][i].aabb;
+                bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].is_leaf = local_nodes[thread_idx][i].is_leaf;
+                if(!local_nodes[thread_idx][i].children[0]->is_leaf) {
+                    bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].children[0] = local_nodes[thread_idx][i].children[0] - local_nodes[thread_idx] + bvh.nodes + local_offset_nodes[thread_idx] + node_idx;
+                }
+                else {
+                    bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].children[0] = local_nodes[thread_idx][i].children[0] - local_leaves[thread_idx] + bvh.leaves + local_offset_leaves[thread_idx] + leaf_idx;
+                }
+
+                if(!local_nodes[thread_idx][i].children[1]->is_leaf) {
+                    bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].children[1] = local_nodes[thread_idx][i].children[1] - local_nodes[thread_idx] + bvh.nodes + local_offset_nodes[thread_idx] + node_idx;
+                }
+                else {
+                    bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].children[1] = local_nodes[thread_idx][i].children[1] - local_leaves[thread_idx] + bvh.leaves + local_offset_leaves[thread_idx] + leaf_idx;
+                }
+                bvh.nodes[i + local_offset_nodes[thread_idx] + node_idx].num_triangles = 0;
+
+            }
+            for(int i = 0; i < local_num_leaves[thread_idx]; i++) {
+                bvh.leaves[i + local_offset_leaves[thread_idx] + leaf_idx].aabb = local_leaves[thread_idx][i].aabb;
+                bvh.leaves[i + local_offset_leaves[thread_idx] + leaf_idx].is_leaf = local_leaves[thread_idx][i].is_leaf;
+                bvh.leaves[i + local_offset_leaves[thread_idx] + leaf_idx].num_triangles = local_leaves[thread_idx][i].num_triangles;
+                bvh.leaves[i + local_offset_leaves[thread_idx] + leaf_idx].triangle_indices = new int[local_leaves[thread_idx][i].num_triangles];
+                std::copy(local_leaves[thread_idx][i].triangle_indices, local_leaves[thread_idx][i].triangle_indices + local_leaves[thread_idx][i].num_triangles, bvh.leaves[i + local_offset_leaves[thread_idx] + leaf_idx].triangle_indices);
+            }
+            int parent_idx = queue[thread_idx].node_idx;
+
+            if (!local_nodes[thread_idx][0].children[0]->is_leaf){
+                bvh.nodes[parent_idx].children[0] = (local_nodes[thread_idx][0].children[0] - local_nodes[thread_idx]) + bvh.nodes + local_offset_nodes[thread_idx] + node_idx;
+            }
+            else {
+                bvh.nodes[parent_idx].children[0] = (local_nodes[thread_idx][0].children[0] - local_leaves[thread_idx]) + bvh.leaves + local_offset_leaves[thread_idx] + leaf_idx;
+            }
+            if (!local_nodes[thread_idx][0].children[1]->is_leaf){
+                bvh.nodes[parent_idx].children[1] = (local_nodes[thread_idx][0].children[1] - local_nodes[thread_idx]) + bvh.nodes + local_offset_nodes[thread_idx] + node_idx;
+            }
+            else {
+                bvh.nodes[parent_idx].children[1] = (local_nodes[thread_idx][0].children[1] - local_leaves[thread_idx]) + bvh.leaves + local_offset_leaves[thread_idx] + leaf_idx;
+            }
+
         }
 
         // reduce times using max
