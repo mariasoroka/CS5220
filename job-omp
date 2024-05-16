@@ -11,5 +11,5 @@ export OMP_PLACES=cores
 export OMP_PROC_BIND=spread
 
 #run the application:
-srun -n 1 -c 1 --cpu_bind=cores ./build_tree
+srun -n 1 -c 1 --cpu_bind=cores ./build_tree -f "/global/homes/m/msoroka/HW1/CS5220_2024SP/project/meshes/dragon.obj"
 
