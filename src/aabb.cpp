@@ -1,7 +1,16 @@
 #include "aabb.h"
+#include "builder.h"
+#include <math.h>      
+
+bool is_degenerate(const AABB &aabb) {
+    return aabb.pmin.x >= aabb.pmax.x || aabb.pmin.y >= aabb.pmax.y || aabb.pmin.z >= aabb.pmax.z;
+}
 
 float get_area(const AABB &aabb) {
     Vector3 diff = aabb.pmax - aabb.pmin;
+    if (is_degenerate(aabb)) {
+        return 0;
+    }
     return 2 * (diff.x * diff.y + diff.y * diff.z + diff.z * diff.x);
 }
 
