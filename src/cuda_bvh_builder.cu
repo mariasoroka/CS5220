@@ -310,7 +310,8 @@ __device__ inline int getLongestAxis(float3 min, float3 max, float& length, floa
 }
 
 // Each threadblock clears the bins for one queue entry.
-__global__ void horizontalClearBins(DeviceUniforms u) {
+__global__ __launch_bounds__(WARP_THREADS)
+void horizontalClearBins(DeviceUniforms u) {
     uint queueId = blockIdx.x;
     if (threadIdx.x < NUM_BINS) {
         TriBin& bin = u.bins[queueId*NUM_BINS + threadIdx.x];
@@ -320,7 +321,53 @@ __global__ void horizontalClearBins(DeviceUniforms u) {
     }
 }
 
-__global__ void horizontalPrebin(DeviceUniforms u, uint level) {
+
+__device__ void prebinShared_sync(const DeviceUniforms& u, const Node& node, TriBin* sBins, uint offset, uint stride) {
+    // Identify binning axis
+    float axisLength, axisStart;
+    int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
+
+    // Precompute k1 constant from Wald07
+    constexpr float almostOne = 1.0f - 10.0f*FLT_EPSILON;
+    float k1 = (NUM_BINS*almostOne)/axisLength;
+
+    // We pull the axis conditional outside of the loop to avoid rechecking it
+    // every loop iteration. GPUs don't have a branch predictor, and repeated
+    // predication is still expensive. To avoid code duplication we use a macro.
+    // This also copies triangles into the aux space. Originally I tried to do
+    // this inside the partitioning kernel, but I needed to split the
+    // partitioning kernel into two and introduce a global sync, so it's
+    // preferable to do it here.
+#define BUILD_OVER(cmp) \
+    for (uint triId = node.triStart + offset; \
+              triId < node.triEnd; \
+              triId += stride) { \
+        float4 minId4 = u.triMinsIds[triId]; \
+        float4 max4 = u.triMaxs[triId]; \
+        float center = 0.5f * (minId4. cmp + max4. cmp); \
+        uint binId = uint(k1 * (center-axisStart)); \
+        max4.w = __uint_as_float(binId); \
+        u.triMinsIdsAux[triId] = minId4; \
+        u.triMaxsBinsAux[triId] = max4; \
+        TriBin& bin = sBins[binId]; \
+        atomicAdd_block(&bin.count, 1); \
+        atomic_fmin_ew3_block(&bin.min, {minId4.x, minId4.y, minId4.z}); \
+        atomic_fmax_ew3_block(&bin.max, {max4.x, max4.y, max4.z}); \
+    }
+
+    if (axis == 0) {
+        BUILD_OVER(x);
+    } else if (axis == 1) {
+        BUILD_OVER(y);
+    } else {
+        BUILD_OVER(z);
+    }
+    __syncthreads();
+#undef BUILD_OVER
+}
+
+__global__ __launch_bounds__(OPT_THREADS)
+void horizontalPrebin(DeviceUniforms u, uint level) {
     // Level 0: All threadblocks process node 0.
     // Level 1: The first half of threadblocks process node 1+0,
     //          the other half process node 1+1.
@@ -350,61 +397,20 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
             node.tMax.x, node.tMax.y, node.tMax.z);
     }
 
-    // Identify binning axis
-    float axisLength, axisStart;
-    int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
-
-    // Precompute k1 constant from Wald07
-    constexpr float almostOne = 1.0f - 10.0f*FLT_EPSILON;
-    float k1 = (NUM_BINS*almostOne)/axisLength;
-
     // Cache bins in shared memory. We'll atomically update the global bins afterwards.
     // Each bin is 64 bytes, so with 16 bins we're using 1024 bytes of shared memory.
     // If we can keep register usage < 32 then we get 100% occupancy. :)
-    __shared__ TriBin bins[NUM_BINS];
-    if (threadIdx.x < NUM_BINS) {
-        bins[threadIdx.x] = TriBin();
-    }
+    __shared__ TriBin sBins[NUM_BINS];
+    if (threadIdx.x < NUM_BINS) sBins[threadIdx.x] = TriBin();
     __syncthreads();
 
-    // We pull the axis conditional outside of the loop to avoid rechecking it
-    // every loop iteration. GPUs don't have a branch predictor, and repeated
-    // predication is still expensive. To avoid code duplication we use a macro.
-    // This also copies triangles into the aux space. Originally I tried to do
-    // this inside the partitioning kernel, but I needed to split the
-    // partitioning kernel into two and introduce a global sync, so it's
-    // preferable to do it here.
-#define BUILD_OVER(cmp) \
-    for (uint triId = node.triStart + localThreadId; \
-              triId < node.triEnd; \
-              triId += localThreads) { \
-        float4 minId4 = u.triMinsIds[triId]; \
-        float4 max4 = u.triMaxs[triId]; \
-        float center = 0.5f * (minId4. cmp + max4. cmp); \
-        uint binId = uint(k1 * (center-axisStart)); \
-        max4.w = __uint_as_float(binId); \
-        u.triMinsIdsAux[triId] = minId4; \
-        u.triMaxsBinsAux[triId] = max4; \
-        TriBin& bin = bins[binId]; \
-        atomicAdd_block(&bin.count, 1); \
-        atomic_fmin_ew3_block(&bin.min, {minId4.x, minId4.y, minId4.z}); \
-        atomic_fmax_ew3_block(&bin.max, {max4.x, max4.y, max4.z}); \
-    }
-
-    if (axis == 0) {
-        BUILD_OVER(x);
-    } else if (axis == 1) {
-        BUILD_OVER(y);
-    } else {
-        BUILD_OVER(z);
-    }
-    __syncthreads();
-#undef BUILD_OVER
+    // Actually perform prebinning into shared memory bins.
+    prebinShared_sync(u, node, sBins, localThreadId, localThreads);
 
     // Shared memory now contains an accurate view of all the bins processed by
     // this threadblock. Let's merge them into the global view.
     if (threadIdx.x < NUM_BINS) {
-        const TriBin& sBin = bins[threadIdx.x];
+        const TriBin& sBin = sBins[threadIdx.x];
         TriBin& gBin = u.bins[queueId*NUM_BINS + threadIdx.x];
         atomicAdd(&gBin.count, sBin.count);
         atomic_fmin_ew3(&gBin.min, sBin.min);
@@ -412,35 +418,14 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
     }
 }
 
-// This kernel expects one threadblock for each filled queue entry.
-// There are 2^level queue entries at that level.
-__global__ __launch_bounds__(WARP_THREADS) 
-void horizontalScan(DeviceUniforms u, uint level) {
-    uint queueId = blockIdx.x;
-    uint mask = (1u << level) - 1u;
-    uint nodeId = mask + queueId;
-    if (u.nodes[nodeId].isLeaf()) {
-        // This kernel is in charge of setting up the child nodes, so we'll need
-        // to ensure the child nodes are treated as leaves and skipped.
-        if (threadIdx.x == 0) {
-            Node& leftChild = u.nodes[2*nodeId+1];
-            leftChild.triStart = 0;
-            leftChild.triEnd = 0;
-
-            Node& rightChild = u.nodes[2*nodeId+2];
-            rightChild.triStart = 0;
-            rightChild.triEnd = 0;
-        }
-        return;
-    }
-
+__device__ void scanUVM(const DeviceUniforms& u, const TriBin* __restrict__ uvmBins, uint nodeId) {
     // Each thread evaluates a different split. A lot of threads are unused
     // since we only have NUM_BINS-1 splits to evaluate.
     TriSplitStats stats = {};
     uint splitId = 1 + threadIdx.x;
 
     for (uint binId = 0; binId < NUM_BINS; ++binId) {
-        const TriBin& bin = u.bins[queueId*NUM_BINS+binId];
+        const TriBin& bin = uvmBins[binId];
         if (binId < splitId) {
             stats.inLeft += bin.count;
             stats.ltMin = fmin3(stats.ltMin, bin.min);
@@ -498,7 +483,33 @@ void horizontalScan(DeviceUniforms u, uint level) {
     }
 }
 
-__global__ void horizontalPartition(DeviceUniforms u, uint level) {
+// This kernel expects one threadblock for each filled queue entry.
+// There are 2^level queue entries at that level.
+__global__ __launch_bounds__(WARP_THREADS) 
+void horizontalScan(DeviceUniforms u, uint level) {
+    uint queueId = blockIdx.x;
+    uint mask = (1u << level) - 1u;
+    uint nodeId = mask + queueId;
+    if (u.nodes[nodeId].isLeaf()) {
+        // This kernel is in charge of setting up the child nodes, so we'll need
+        // to ensure the child nodes are treated as leaves and skipped.
+        if (threadIdx.x == 0) {
+            Node& leftChild = u.nodes[2*nodeId+1];
+            leftChild.triStart = 0;
+            leftChild.triEnd = 0;
+
+            Node& rightChild = u.nodes[2*nodeId+2];
+            rightChild.triStart = 0;
+            rightChild.triEnd = 0;
+        }
+        return;
+    }
+
+    scanUVM(u, &u.bins[queueId*NUM_BINS], nodeId);
+}
+
+__global__ __launch_bounds__(OPT_THREADS)
+void horizontalPartition(DeviceUniforms u, uint level) {
     uint mask = (1u << level) - 1u;
     uint queueId = mask & blockIdx.x;
     uint nodeId = mask + queueId;
@@ -608,7 +619,8 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     }
 }
 
-__global__ void horizontalValidate(DeviceUniforms u, uint level) {
+__global__ __launch_bounds__(1)
+void horizontalValidate(DeviceUniforms u, uint level) {
     uint mask = (1u << level) - 1u;
     uint nodeId = mask + blockIdx.x;
     Node& node = u.nodes[nodeId];
@@ -658,6 +670,28 @@ __global__ void horizontalValidate(DeviceUniforms u, uint level) {
     }
 }
 
+__global__ __launch_bounds__(OPT_THREADS)
+void vertical(DeviceUniforms u, uint baseNodeId) {
+    // ====== PREBINNING ======
+    uint nodeId = baseNodeId + blockIdx.x;
+    Node& node = u.nodes[nodeId];
+    if (node.isLeaf()) {
+        return;
+    }
+
+    // Cache bins in shared memory. See horizontalPrebin.
+    __shared__ TriBin sBins[NUM_BINS];
+    if (threadIdx.x < NUM_BINS) sBins[threadIdx.x] = TriBin();
+    __syncthreads();
+
+    // Actually perform prebinning.
+    prebinShared_sync(u, node, sBins, threadIdx.x, blockDim.x);
+
+    // ====== HORIZONTAL SCAN ======
+    scanUVM(u, sBins, nodeId);
+}
+
+
 std::shared_ptr<CudaBVH> build_cuda_bvh(
     triangle* tris, 
     int numTris
@@ -698,6 +732,8 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     for (int hLevel = 0; hLevel <= HORIZONTAL_LEVELS; ++hLevel) {
         cudaEventCreate(&horizTimes[hLevel]);
     }
+    cudaEvent_t verticalEnd;
+    cudaEventCreate(&verticalEnd);
     
     // Horizontal binning
     cudaEventRecord(horizTimes[0]);
@@ -711,8 +747,20 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaEventRecord(horizTimes[hLevel+1]);
     }
 
+    // Vertical binning
+    uint baseNodeId = (1u << HORIZONTAL_LEVELS) - 1u;
+    vertical<<<QUEUE_SIZE, OPT_THREADS>>>(u, baseNodeId);
+    cudaEventRecord(verticalEnd);
+
     // Synchronize
     cudaDeviceSynchronize();
+
+    // Copy device root node back onto host for debugging purposes
+    cudaMemcpy(
+        &root,
+        u.nodes,
+        sizeof(Node),
+        cudaMemcpyDeviceToHost);
 
     printf("\n====== STATS ======\n");
 
@@ -732,12 +780,12 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         printf("  ↪ %2u: %f ms\n", hLevel, horizTimeMs);
     }
 
-    // Copy device root node back onto host for debugging purposes
-    cudaMemcpy(
-        &root,
-        u.nodes,
-        sizeof(Node),
-        cudaMemcpyDeviceToHost);
+    float totalVerticalTimeMs = 0.0f;
+    cudaEventElapsedTime(
+        &totalVerticalTimeMs,
+        horizTimes[HORIZONTAL_LEVELS],
+        verticalEnd);
+    printf("Vertical: %f ms\n", totalVerticalTimeMs);
     
     // Debug info
     printf("Geometry Min: [%f, %f, %f]\nGeometry Max: [%f, %f, %f]\n", 
