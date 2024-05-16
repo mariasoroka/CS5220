@@ -1,6 +1,8 @@
 #include "cuda_bvh_builder.h"
 
 #include <cfloat>
+#include <deque>
+#include <vector>
 
 void touch_cuda() {
     cudaDeviceSynchronize();
@@ -158,11 +160,11 @@ struct Node {
         tMax { -INFINITY, -INFINITY, -INFINITY }
     {}
     
-    __device__ inline uint count() const {
+    __host__ __device__ inline uint count() const {
         return triEnd - triStart;
     }
 
-    __device__ inline bool isLeaf() const {
+    __host__ __device__ inline bool isLeaf() const {
         constexpr int LEAF_THRESHOLD = 4;
         return count() <= LEAF_THRESHOLD;
     }
@@ -772,13 +774,8 @@ void vertical(DeviceUniforms u, uint baseNodeId, uint depth) {
         cudaStream_t stream;
         auto code = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         vertical<<<2, OPT_THREADS, 0, stream>>>(u, 2*nodeId+1, depth+1);
-        auto last = cudaPeekAtLastError();
-        if (last != cudaSuccess) {
-            printf("ERR: %s\n", cudaGetErrorString(last));
-        }
         cudaStreamDestroy(stream);
     }
-
 }
 
 
@@ -805,10 +802,11 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaMemcpyHostToDevice);
 
     // Copy root node into device memory
-    Node root(0, numTris);
+    Node* nodes = (Node*)malloc((2*numTris-1)*sizeof(Node));
+    nodes[0] = Node(0, numTris);
     cudaMemcpy(
         u.nodes,
-        &root,
+        nodes,
         sizeof(Node),
         cudaMemcpyHostToDevice);
     
@@ -845,11 +843,11 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     // Synchronize
     cudaDeviceSynchronize();
 
-    // Copy device root node back onto host for debugging purposes
+    // Copy BVH nodes back onto the host for debugging purposes
     cudaMemcpy(
-        &root,
+        nodes,
         u.nodes,
-        sizeof(Node),
+        (2*numTris-1)*sizeof(Node),
         cudaMemcpyDeviceToHost);
 
     printf("\n====== STATS ======\n");
@@ -879,8 +877,31 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     
     // Debug info
     printf("Geometry Min: [%f, %f, %f]\nGeometry Max: [%f, %f, %f]\n", 
-        root.tMin.x, root.tMin.y, root.tMin.z,
-        root.tMax.x, root.tMax.y, root.tMax.z);
+        nodes[0].tMin.x, nodes[0].tMin.y, nodes[0].tMin.z,
+        nodes[0].tMax.x, nodes[0].tMax.y, nodes[0].tMax.z);
+
+    // BFS through nodes.
+    std::deque<uint2> queue;
+    std::vector<uint> nodeCountPerLevel;
+    queue.push_back({1, 0});
+    while (!queue.empty()) {
+        auto [nodeId, level] = queue.front();
+        queue.pop_front();
+        
+        nodeCountPerLevel.resize(level+1, 0);
+        nodeCountPerLevel[level] += 1;
+        
+        Node& node = nodes[nodeId];
+        if ( !(node.isLeaf() || 2*nodeId+2 >= u.numTris) ){
+            queue.push_back({2*nodeId+1, level+1});
+            queue.push_back({2*nodeId+2, level+1});
+        }
+    }
+    free(nodes);
+    printf("Nodes per Level:\n");
+    for (int level = 0; level < nodeCountPerLevel.size(); ++level) {
+        printf("  ↪ %2u: %u\n", level, nodeCountPerLevel[level]);
+    }
 
     return std::make_shared<CudaBVH>(u);
 }
