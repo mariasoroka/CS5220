@@ -37,7 +37,8 @@ int main(int argc, char** argv) {
     triangle* triangles;
     int num_triangles;
     load_obj(filename, &triangles, num_triangles);
-
+    
+    touch_cuda();
     auto start = std::chrono::high_resolution_clock::now();
 
 #if 0

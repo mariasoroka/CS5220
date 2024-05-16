@@ -2,6 +2,10 @@
 
 #include <cfloat>
 
+void touch_cuda() {
+    cudaDeviceSynchronize();
+}
+
 // Return the number of p-sized blocks needed to cover N
 template<typename T>
 constexpr T NP2(T n, T p) {
@@ -337,7 +341,7 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
     uint localThreads = localBlocks*blockDim.x;
 
     // Debug stats
-    if (localThreadId == 0 && level <= 2) {
+    if (level <= 2 && localThreadId == 0) {
         printf("%*s↪ %u: %i, c[%f, %f, %f][%f, %f, %f], t[%f, %f, %f][%f, %f, %f]\n", 
             level, "", nodeId, node.count(),
             node.cMin.x, node.cMin.y, node.cMin.z, 
@@ -684,16 +688,19 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         sizeof(Node),
         cudaMemcpyHostToDevice);
     
+    printf("\n====== KERNEL OUTPUT ======\n");
+
     // Compute triangle AABBs
     setupTris<<<NP2(numTris, OPT_THREADS), OPT_THREADS>>>(u);
 
     // Create profiling events
-    cudaEvent_t horizStart, horizEnd;
-    cudaEventCreate(&horizStart);
-    cudaEventCreate(&horizEnd);
-
+    cudaEvent_t horizTimes[HORIZONTAL_LEVELS+1];
+    for (int hLevel = 0; hLevel <= HORIZONTAL_LEVELS; ++hLevel) {
+        cudaEventCreate(&horizTimes[hLevel]);
+    }
+    
     // Horizontal binning
-    cudaEventRecord(horizStart);
+    cudaEventRecord(horizTimes[0]);
     for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
         uint twoLevel = (1 << hLevel);
         horizontalClearBins<<<twoLevel, WARP_THREADS>>>(u);
@@ -701,16 +708,29 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         horizontalScan<<<twoLevel, WARP_THREADS>>>(u, hLevel);
         horizontalPartition<<<QUEUE_SIZE, OPT_THREADS>>>(u, hLevel);
         // horizontalValidate<<<twoLevel, 1>>>(u, hLevel);
+        cudaEventRecord(horizTimes[hLevel+1]);
     }
-    cudaEventRecord(horizEnd);
 
     // Synchronize
     cudaDeviceSynchronize();
 
-    // Print stats
-    float horizTimeMs = 0.0f;
-    cudaEventElapsedTime(&horizTimeMs, horizStart, horizEnd);
-    printf("GPU elapsed: %f ms\n", horizTimeMs);
+    printf("\n====== STATS ======\n");
+
+    float totalHorizTimeMs = 0.0f;
+    cudaEventElapsedTime(
+        &totalHorizTimeMs, 
+        horizTimes[0], 
+        horizTimes[HORIZONTAL_LEVELS]);
+    printf("Horizontal: %f ms\n", totalHorizTimeMs);
+
+    for(int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
+        float horizTimeMs = 0.0f;
+        cudaEventElapsedTime(
+            &horizTimeMs,
+            horizTimes[hLevel],
+            horizTimes[hLevel+1]);
+        printf("  ↪ %2u: %f ms\n", hLevel, horizTimeMs);
+    }
 
     // Copy device root node back onto host for debugging purposes
     cudaMemcpy(
@@ -720,7 +740,7 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaMemcpyDeviceToHost);
     
     // Debug info
-    printf("Geometry: [%f, %f, %f] to [%f, %f, %f]\n", 
+    printf("Geometry Min: [%f, %f, %f]\nGeometry Max: [%f, %f, %f]\n", 
         root.tMin.x, root.tMin.y, root.tMin.z,
         root.tMax.x, root.tMax.y, root.tMax.z);
 
