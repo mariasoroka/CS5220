@@ -308,9 +308,8 @@ __device__ inline int getLongestAxis(float3 min, float3 max, float& length, floa
 // Each threadblock clears the bins for one queue entry.
 __global__ void horizontalClearBins(DeviceUniforms u) {
     uint queueId = blockIdx.x;
-    TriBin* bins = &u.bins[queueId*NUM_BINS];
     if (threadIdx.x < NUM_BINS) {
-        TriBin& bin = bins[threadIdx.x];
+        TriBin& bin = u.bins[queueId*NUM_BINS + threadIdx.x];
         bin.count = 0;
         bin.min = {+INFINITY, +INFINITY, +INFINITY};
         bin.max = {-INFINITY, -INFINITY, -INFINITY};
@@ -339,7 +338,7 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
 
     // Debug stats
     if (localThreadId == 0 && level <= 2) {
-        printf("%*s↪ node %u: %i tris, [%.2f,%2.f,%.2f][%.2f,%2.f,%2.f] centroid, [%.2f,%.2f,%.2f][%.2f,%.2f,%.2f] geometry\n", 
+        printf("%*s↪ %u: %i, c[%f, %f, %f][%f, %f, %f], t[%f, %f, %f][%f, %f, %f]\n", 
             level, "", nodeId, node.count(),
             node.cMin.x, node.cMin.y, node.cMin.z, 
             node.cMax.x, node.cMax.y, node.cMax.z,
@@ -401,7 +400,7 @@ __global__ void horizontalPrebin(DeviceUniforms u, uint level) {
     // Shared memory now contains an accurate view of all the bins processed by
     // this threadblock. Let's merge them into the global view.
     if (threadIdx.x < NUM_BINS) {
-        TriBin& sBin = bins[threadIdx.x];
+        const TriBin& sBin = bins[threadIdx.x];
         TriBin& gBin = u.bins[queueId*NUM_BINS + threadIdx.x];
         atomicAdd(&gBin.count, sBin.count);
         atomic_fmin_ew3(&gBin.min, sBin.min);
@@ -423,6 +422,7 @@ void horizontalScan(DeviceUniforms u, uint level) {
             Node& leftChild = u.nodes[2*nodeId+1];
             leftChild.triStart = 0;
             leftChild.triEnd = 0;
+
             Node& rightChild = u.nodes[2*nodeId+2];
             rightChild.triStart = 0;
             rightChild.triEnd = 0;
@@ -430,15 +430,13 @@ void horizontalScan(DeviceUniforms u, uint level) {
         return;
     }
 
-    const TriBin* bins = &u.bins[queueId*NUM_BINS];
-
     // Each thread evaluates a different split. A lot of threads are unused
     // since we only have NUM_BINS-1 splits to evaluate.
     TriSplitStats stats = {};
     uint splitId = 1 + threadIdx.x;
 
     for (uint binId = 0; binId < NUM_BINS; ++binId) {
-        const TriBin& bin = bins[binId];
+        const TriBin& bin = u.bins[queueId*NUM_BINS+binId];
         if (binId < splitId) {
             stats.inLeft += bin.count;
             stats.ltMin = fmin3(stats.ltMin, bin.min);
@@ -511,10 +509,6 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     uint localThreadId = localBlockId*blockDim.x + threadIdx.x;
     uint localThreads = localBlocks*blockDim.x;
 
-    // Identify binning axis.
-    float axisLength, axisStart;
-    int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
-
     // We build child centroid bounds while iterating, too
     float3 lcMin, lcMax, rcMin, rcMax;
     lcMin = rcMin = { +INFINITY, +INFINITY, +INFINITY };
@@ -524,37 +518,26 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     // fall into the left or right children.
     uint myLeft = 0;
     uint myRight = 0;
-
-#define BUILD_OVER(cmp) \
-    for (uint triId = node.triStart + localThreadId; \
-              triId < node.triEnd; \
-              triId += localThreads) { \
-        float4 minId4 = u.triMinsIdsAux[triId]; \
-        float4 maxBin4 = u.triMaxsBinsAux[triId]; \
-        float3 centroid = { \
-            0.5f * (minId4.x + maxBin4.x), \
-            0.5f * (minId4.y + maxBin4.y), \
-            0.5f * (minId4.z + maxBin4.z) \
-        }; \
-        if (__float_as_uint(maxBin4.w) < node.splitId) { \
-            lcMin = fmin3(lcMin, centroid); \
-            lcMax = fmax3(lcMax, centroid); \
-            myLeft += 1; \
-        } else { \
-            rcMin = fmin3(rcMin, centroid); \
-            rcMax = fmax3(rcMax, centroid); \
-            myRight += 1; \
-        } \
+    for (uint triId = node.triStart + localThreadId;
+              triId < node.triEnd;
+              triId += localThreads) {
+        float4 minId4 = u.triMinsIdsAux[triId];
+        float4 maxBin4 = u.triMaxsBinsAux[triId];
+        float3 centroid = {
+            0.5f * (minId4.x + maxBin4.x),
+            0.5f * (minId4.y + maxBin4.y),
+            0.5f * (minId4.z + maxBin4.z)
+        };
+        if (__float_as_uint(maxBin4.w) < node.splitId) {
+            lcMin = fmin3(lcMin, centroid);
+            lcMax = fmax3(lcMax, centroid);
+            myLeft += 1;
+        } else {
+            rcMin = fmin3(rcMin, centroid);
+            rcMax = fmax3(rcMax, centroid);
+            myRight += 1;
+        }
     }
-
-    if (axis == 0) {
-        BUILD_OVER(x);
-    } else if (axis == 1) {
-        BUILD_OVER(y);
-    } else {
-        BUILD_OVER(z);
-    }
-#undef BUILD_OVER
 
     // Reduce values over threadblock
     __shared__ uint tbLeft;
@@ -622,52 +605,52 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
 }
 
 __global__ void horizontalValidate(DeviceUniforms u, uint level) {
-    bool error = false;
     uint mask = (1u << level) - 1u;
     uint nodeId = mask + blockIdx.x;
     Node& node = u.nodes[nodeId];
+
     if (node.allocTriLeft != node.allocTriRight) {
         printf("[%u] Alloc L/R mismatch: %u vs %u\n", nodeId, node.allocTriLeft, node.allocTriRight);
-        error = true;
     } 
     
     uint leftEnd = u.nodes[2*nodeId+1].triEnd;
     if (node.allocTriLeft != leftEnd) {
         printf("[%u] Left mismatch: %u vs %u\n", nodeId, node.allocTriLeft, leftEnd);
-        error = true;
     }
 
     uint rightStart = u.nodes[2*nodeId+1].triEnd;
     if (node.allocTriRight != rightStart) {
         printf("[%u] Right mismatch: %u vs %u\n", nodeId, node.allocTriRight, rightStart);
-        error = true;
     }
 
     // the big one...
     uint leftWrong = 0;
     for (uint triId = node.triStart; triId < leftEnd; ++triId) {
         float4 max4 = u.triMaxs[triId];
-        if (__float_as_uint(max4.w) >= node.splitId && leftWrong < 5) {
+        if (__float_as_uint(max4.w) >= node.splitId && leftWrong < 1) {
             printf("[%u] Left not partitioned @ tri %u. SplitID: %u, binID: %u\n", 
                 nodeId, triId, node.splitId, __float_as_uint(max4.w));
             leftWrong += 1;
-            error = true;
         }
     }
 
     uint rightWrong = 0;
     for (uint triId = rightStart; triId < node.triEnd; ++triId) {
         float4 max4 = u.triMaxs[triId];
-        if (__float_as_uint(max4.w) < node.splitId && rightWrong < 5) {
+        if (__float_as_uint(max4.w) < node.splitId && rightWrong < 1) {
             printf("[%u] Right not partitioned @ tri %u. SplitID: %u, binID: %u\n", 
                 nodeId, triId, node.splitId, __float_as_uint(max4.w));
             rightWrong += 1;
-            error = true;
         }
     }
 
-    if (!error) {
-        printf("[%u] validated!\n", nodeId);
+    uint binCount = 0;
+    for (uint binId = 0; binId < NUM_BINS; ++binId) {
+        binCount += u.bins[blockIdx.x*NUM_BINS + binId].count;
+    }
+    if (binCount != node.count()) {
+        printf("[%u] Bin counts don't add up: %u vs %u\n", 
+            nodeId, binCount, node.count());
     }
 }
 
@@ -711,13 +694,13 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
 
     // Horizontal binning
     cudaEventRecord(horizStart);
-    for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
-        horizontalClearBins<<<(1 << hLevel), WARP_THREADS>>>(u);
+    for (int hLevel = 0; hLevel < 9; ++hLevel) {
+        uint twoLevel = (1 << hLevel);
+        horizontalClearBins<<<twoLevel, WARP_THREADS>>>(u);
         horizontalPrebin<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
-        horizontalScan<<<(1 << hLevel), WARP_THREADS>>>(u, hLevel);
+        horizontalScan<<<twoLevel, WARP_THREADS>>>(u, hLevel);
         horizontalPartition<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
-        horizontalValidate<<<(1 << hLevel), 1>>>(u, hLevel);
-        break;
+        horizontalValidate<<<twoLevel, 1>>>(u, hLevel);
     }
     cudaEventRecord(horizEnd);
 
