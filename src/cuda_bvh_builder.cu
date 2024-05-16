@@ -322,7 +322,7 @@ void horizontalClearBins(DeviceUniforms u) {
 }
 
 
-__device__ void prebinShared_sync(const DeviceUniforms& u, const Node& node, TriBin* sBins, uint offset, uint stride) {
+__device__ void prebinShared(const DeviceUniforms& u, const Node& node, TriBin* sBins, uint offset, uint stride) {
     // Identify binning axis
     float axisLength, axisStart;
     int axis = getLongestAxis(node.cMin, node.cMax, axisLength, axisStart);
@@ -405,7 +405,7 @@ void horizontalPrebin(DeviceUniforms u, uint level) {
     __syncthreads();
 
     // Actually perform prebinning into shared memory bins.
-    prebinShared_sync(u, node, sBins, localThreadId, localThreads);
+    prebinShared(u, node, sBins, localThreadId, localThreads);
 
     // Shared memory now contains an accurate view of all the bins processed by
     // this threadblock. Let's merge them into the global view.
@@ -419,6 +419,11 @@ void horizontalPrebin(DeviceUniforms u, uint level) {
 }
 
 __device__ void scanUVM(const DeviceUniforms& u, const TriBin* __restrict__ uvmBins, uint nodeId) {
+    // We only need one warp per threadblock participating in this scan.
+    if (threadIdx.x >= WARP_THREADS) {
+        return;
+    }
+
     // Each thread evaluates a different split. A lot of threads are unused
     // since we only have NUM_BINS-1 splits to evaluate.
     TriSplitStats stats = {};
@@ -671,11 +676,14 @@ void horizontalValidate(DeviceUniforms u, uint level) {
 }
 
 __global__ __launch_bounds__(OPT_THREADS)
-void vertical(DeviceUniforms u, uint baseNodeId) {
-    // ====== PREBINNING ======
+void vertical(DeviceUniforms u, uint baseNodeId, uint depth) {
     uint nodeId = baseNodeId + blockIdx.x;
     Node& node = u.nodes[nodeId];
-    if (node.isLeaf()) {
+
+    // KINDA HACK: We treat this node as a leaf if its right child would fall
+    // out of bounds. This is because we only allocated enough nodes for a
+    // balanced tree
+    if (node.isLeaf() || 2*nodeId+2 >= u.numTris) {
         return;
     }
 
@@ -685,10 +693,92 @@ void vertical(DeviceUniforms u, uint baseNodeId) {
     __syncthreads();
 
     // Actually perform prebinning.
-    prebinShared_sync(u, node, sBins, threadIdx.x, blockDim.x);
+    prebinShared(u, node, sBins, threadIdx.x, blockDim.x);
 
-    // ====== HORIZONTAL SCAN ======
+    // Perform horizontal scan over bins.
     scanUVM(u, sBins, nodeId);
+
+    // Now... the parallel partitioning. This is difficult to factor out into a
+    // shared implementation (like what we did for prebinning and scanning)
+
+    // Initialize some atomics used for parallel partitioning
+    __shared__ uint leftAlloc;
+    __shared__ uint rightAlloc;
+    if (threadIdx.x == 0) {
+        leftAlloc = node.allocTriLeft;
+        rightAlloc = node.allocTriRight;
+    }
+    __syncthreads();
+
+    float3 lcMin, lcMax, rcMin, rcMax;
+    lcMin = rcMin = { +INFINITY, +INFINITY, +INFINITY };
+    lcMax = rcMax = { -INFINITY, -INFINITY, -INFINITY };
+
+    // The actual partition
+    for (uint triId = node.triStart + threadIdx.x;
+              triId < node.triEnd;
+              triId += blockDim.x) {
+        float4 minId4 = u.triMinsIdsAux[triId];
+        float4 maxBin4 = u.triMaxsBinsAux[triId];
+        float3 centroid = {
+            0.5f * (minId4.x + maxBin4.x),
+            0.5f * (minId4.y + maxBin4.y),
+            0.5f * (minId4.z + maxBin4.z)
+        };
+        uint outId;
+        if (__float_as_uint(maxBin4.w) < node.splitId) {
+            outId = atomicAdd_block(&leftAlloc, 1);
+            lcMin = fmin3(lcMin, centroid);
+            lcMax = fmax3(lcMax, centroid);
+        } else {
+            outId = atomicSub_block(&rightAlloc, 1) - 1;
+            rcMin = fmin3(rcMin, centroid);
+            rcMax = fmax3(rcMax, centroid);
+        }
+        u.triMinsIds[outId] = minId4;
+        u.triMaxs[outId] = maxBin4;
+    }
+
+    // Find centroid bounds for left and right children
+    __shared__ float3 tbLcMin; 
+    __shared__ float3 tbLcMax;
+    __shared__ float3 tbRcMin;
+    __shared__ float3 tbRcMax;
+    if (threadIdx.x == 0) {
+       tbLcMin = tbRcMin = {+INFINITY, +INFINITY, +INFINITY};
+       tbLcMax = tbRcMax = {-INFINITY, -INFINITY, -INFINITY};
+    }
+    __syncthreads();
+    atomic_fmin_ew3_block(&tbLcMin, lcMin);
+    atomic_fmax_ew3_block(&tbLcMax, lcMax);
+    atomic_fmin_ew3_block(&tbRcMin, rcMin);
+    atomic_fmax_ew3_block(&tbRcMax, rcMax);
+    __syncthreads();
+
+    // Master thread writes out child centroid bounds and launches child kernels
+    if (threadIdx.x == 0) {
+        Node& leftChild = u.nodes[2*nodeId+1];
+        leftChild.cMin = tbLcMin;
+        leftChild.cMax = tbLcMax;
+
+        Node& rightChild = u.nodes[2*nodeId+2];
+        rightChild.cMin = tbRcMin;
+        rightChild.cMax = tbRcMax;
+
+        if (leftChild.isLeaf() && rightChild.isLeaf()) {
+            return;
+        }
+
+        cudaStream_t stream;
+        auto code = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        vertical<<<2, OPT_THREADS, 0, stream>>>(u, 2*nodeId+1, depth+1);
+        auto last = cudaPeekAtLastError();
+        if (last != cudaSuccess) {
+            printf("ERR: %s\n", cudaGetErrorString(last));
+        }
+        cudaStreamDestroy(stream);
+    }
+
 }
 
 
@@ -747,9 +837,9 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         cudaEventRecord(horizTimes[hLevel+1]);
     }
 
-    // Vertical binning
+    cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 32768);
     uint baseNodeId = (1u << HORIZONTAL_LEVELS) - 1u;
-    vertical<<<QUEUE_SIZE, OPT_THREADS>>>(u, baseNodeId);
+    vertical<<<QUEUE_SIZE, OPT_THREADS>>>(u, baseNodeId, 0);
     cudaEventRecord(verticalEnd);
 
     // Synchronize
