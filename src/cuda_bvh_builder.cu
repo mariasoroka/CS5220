@@ -584,7 +584,7 @@ __global__ void horizontalPartition(DeviceUniforms u, uint level) {
     __shared__ uint tbRightAlloc;
     if (threadIdx.x == 0) {
         tbLeftAlloc = atomicAdd(&node.allocTriLeft, tbLeft);
-        tbRightAlloc = atomicSub(&node.allocTriRight, tbRight);
+        tbRightAlloc = atomicSub(&node.allocTriRight, tbRight) - tbRight;
 
         Node& leftChild = u.nodes[2*nodeId+1];
         atomic_fmin_ew3(&leftChild.cMin, tbLcMin);
