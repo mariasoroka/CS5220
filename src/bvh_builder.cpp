@@ -34,7 +34,7 @@ the bounding box of the node should be split and location split_loc where the cu
 The function also uses bounding boxes of all the triangles (triangle_bounds), 
 positions of triangle centers (triangle_centers) and indices of triangles array (triangle_idxs).*/
 SplitNode get_split_node(const StackNode &node, float split_loc, int axis,
-                         const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers) {
+                         const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers, bool remove_degenerate) {
     // partition triangles in triangle_idxs[node.i0, node.i1] into two groups based on the position of their centers relative to split_loc
     auto it = std::partition(triangle_idxs + node.i0, triangle_idxs + node.i1,
                                     [triangle_idxs, triangle_centers, &split_loc, &axis](int i) {
@@ -43,8 +43,10 @@ SplitNode get_split_node(const StackNode &node, float split_loc, int axis,
 
 
     // if the split is degenerate, put half of the triangles in each group
-    if (it == triangle_idxs + node.i0 || it == triangle_idxs + node.i1) {
-        it = triangle_idxs + (node.i0 + node.i1) / 2;
+    if (remove_degenerate) {
+        if (it == triangle_idxs + node.i0 || it == triangle_idxs + node.i1) {
+            it = triangle_idxs + (node.i0 + node.i1) / 2;
+        }
     }
 
 
@@ -77,7 +79,7 @@ void get_costs(const StackNode &node, float *costs, const AABB *triangle_bounds,
         // compute the location of the split
         float split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
         // get the two children of the node if it is split at split_loc
-        SplitNode split_node = get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+        SplitNode split_node = get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers, false);
         // if the split is degenerate, set the cost to infinity
         if (split_node.child0.i1 == node.i0 || split_node.child0.i1 == node.i1) {
             costs[i] = infinity();
@@ -114,7 +116,7 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     // compute the split
     float split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
-    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers, true);
 }
 
 /*This function builds a BVH for the given set of triangles.*/
