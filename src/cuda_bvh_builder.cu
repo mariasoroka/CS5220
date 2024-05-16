@@ -228,6 +228,15 @@ struct DeviceUniforms {
     // There are QUEUE_SIZE * NUM_BINS of these.
     // Indexed by queue ID, then by bin index.
     TriBin* __restrict__ bins;
+
+    // Shared work queue for the vertical binning phase.
+    // 0 = nothing needs to be done.
+    uint* __restrict__ verticalQueueRaw;
+    uint* __restrict__ verticalQueueCompact;
+
+    // The sizes of each queue. There are two of these. 
+    // We ping pong between these
+    uint* __restrict__ verticalQueueSizes;
 };
 
 class CudaBVH {
@@ -677,9 +686,47 @@ void horizontalValidate(DeviceUniforms u, uint level) {
     }
 }
 
+__global__ __launch_bounds__(1)
+void verticalSetup(DeviceUniforms u, uint level) {
+    uint queueId = blockIdx.x;
+    uint mask = (1u << level) - 1u;
+    uint nodeId = mask + queueId;
+    if (u.nodes[nodeId].isLeaf()) { return; }
+
+    uint outId = atomicAdd(&u.verticalQueueSizes[1], 1);
+    u.verticalQueueCompact[outId] = nodeId;
+}
+
+__global__ __launch_bounds__(WARP_THREADS)
+void verticalCompact(DeviceUniforms u, uint generation) {
+    uint g = generation & 1;
+    uint queueId = blockIdx.x*blockDim.x + threadIdx.x;
+    if (queueId >= 2*u.numTris-1) { 
+        // Skip OOB threads
+        return; 
+    } else if (queueId == 0) { 
+        // Clear last generation's size for the next iteration
+        u.verticalQueueSizes[1-g] = 0; 
+    }
+    
+    // Load and clear last queue entry
+    uint nodeId = u.verticalQueueRaw[queueId];
+    u.verticalQueueRaw[queueId] = 0;
+
+    if (nodeId == 0) { return; }
+    
+    // Compiler should warp-reduce this
+    uint outId = atomicAdd(&u.verticalQueueSizes[g], 1);
+    u.verticalQueueCompact[outId] = nodeId;
+}
+
 __global__ __launch_bounds__(OPT_THREADS)
-void vertical(DeviceUniforms u, uint baseNodeId, uint depth) {
-    uint nodeId = baseNodeId + blockIdx.x;
+void verticalBuild(DeviceUniforms u, uint generation) {
+    uint nodeId = u.verticalQueueCompact[blockIdx.x];
+    if (nodeId == 0) {
+        return;
+    }
+
     Node& node = u.nodes[nodeId];
 
     // KINDA HACK: We treat this node as a leaf if its right child would fall
@@ -767,14 +814,10 @@ void vertical(DeviceUniforms u, uint baseNodeId, uint depth) {
         rightChild.cMin = tbRcMin;
         rightChild.cMax = tbRcMax;
 
-        if (leftChild.isLeaf() && rightChild.isLeaf()) {
-            return;
+        if (!leftChild.isLeaf() || !rightChild.isLeaf()) {
+            u.verticalQueueRaw[2*nodeId+1] = 2*nodeId+1;
+            u.verticalQueueRaw[2*nodeId+2] = 2*nodeId+2; 
         }
-
-        cudaStream_t stream;
-        auto code = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-        vertical<<<2, OPT_THREADS, 0, stream>>>(u, 2*nodeId+1, depth+1);
-        cudaStreamDestroy(stream);
     }
 }
 
@@ -783,6 +826,9 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     triangle* tris, 
     int numTris
 ) {
+    const int maxNodes = (2*numTris-1);
+    const int levels = int(ceil(log2(numTris)));
+
     DeviceUniforms u;
 
     u.numTris = numTris;
@@ -791,8 +837,11 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     cudaMalloc((float4**)&u.triMaxs, numTris*sizeof(float4));
     cudaMalloc((float4**)&u.triMinsIdsAux, numTris*sizeof(float4));
     cudaMalloc((float4**)&u.triMaxsBinsAux, numTris*sizeof(float4));
-    cudaMalloc((Node**)&u.nodes, (2*numTris-1)*sizeof(Node));
+    cudaMalloc((Node**)&u.nodes, maxNodes*sizeof(Node));
     cudaMalloc((TriBin**)&u.bins, QUEUE_SIZE*NUM_BINS*sizeof(TriBin));
+    cudaMalloc((uint**)&u.verticalQueueRaw, maxNodes*sizeof(uint));
+    cudaMalloc((uint**)&u.verticalQueueCompact, maxNodes*sizeof(uint));
+    cudaMalloc((uint**)&u.verticalQueueSizes, 2*sizeof(uint));
 
     // Copy triangles into device memory
     cudaMemcpy(
@@ -800,9 +849,14 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         tris, 
         numTris*sizeof(triangle), 
         cudaMemcpyHostToDevice);
+    
+    // Clear vertical queues
+    cudaMemset(u.verticalQueueRaw, 0, maxNodes*sizeof(uint));
+    cudaMemset(u.verticalQueueCompact, 0, maxNodes*sizeof(uint));
+    cudaMemset(u.verticalQueueSizes, 0, 2*sizeof(uint));
 
     // Copy root node into device memory
-    Node* nodes = (Node*)malloc((2*numTris-1)*sizeof(Node));
+    Node* nodes = (Node*)malloc(maxNodes*sizeof(Node));
     nodes[0] = Node(0, numTris);
     cudaMemcpy(
         u.nodes,
@@ -816,15 +870,13 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     setupTris<<<NP2(numTris, OPT_THREADS), OPT_THREADS>>>(u);
 
     // Create profiling events
-    cudaEvent_t horizTimes[HORIZONTAL_LEVELS+1];
-    for (int hLevel = 0; hLevel <= HORIZONTAL_LEVELS; ++hLevel) {
-        cudaEventCreate(&horizTimes[hLevel]);
+    cudaEvent_t times[levels+1];
+    for (int level = 0; level <= levels; ++level) {
+        cudaEventCreate(&times[level]);
     }
-    cudaEvent_t verticalEnd;
-    cudaEventCreate(&verticalEnd);
     
     // Horizontal binning
-    cudaEventRecord(horizTimes[0]);
+    cudaEventRecord(times[0]);
     for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
         uint twoLevel = (1 << hLevel);
         horizontalClearBins<<<twoLevel, WARP_THREADS>>>(u);
@@ -832,13 +884,19 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         horizontalScan<<<twoLevel, WARP_THREADS>>>(u, hLevel);
         horizontalPartition<<<QUEUE_SIZE, OPT_THREADS>>>(u, hLevel);
         // horizontalValidate<<<twoLevel, 1>>>(u, hLevel);
-        cudaEventRecord(horizTimes[hLevel+1]);
+        cudaEventRecord(times[hLevel+1]);
     }
 
-    cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 32768);
-    uint baseNodeId = (1u << HORIZONTAL_LEVELS) - 1u;
-    vertical<<<QUEUE_SIZE, OPT_THREADS>>>(u, baseNodeId, 0);
-    cudaEventRecord(verticalEnd);
+    // Write out horizontal queue entries into vertical queue
+    verticalSetup<<<(1 << HORIZONTAL_LEVELS), 1>>>(u, HORIZONTAL_LEVELS);
+
+    // Run vertical binning
+    const int verticalLevels = levels - HORIZONTAL_LEVELS;
+    for (int vLevel = 0; vLevel < verticalLevels; ++vLevel) {
+        verticalBuild<<<maxNodes, OPT_THREADS>>>(u, vLevel);
+        verticalCompact<<<NP2(maxNodes, WARP_THREADS), WARP_THREADS>>>(u, vLevel);
+        cudaEventRecord(times[vLevel+HORIZONTAL_LEVELS+1]);
+    }
 
     // Synchronize
     cudaDeviceSynchronize();
@@ -847,34 +905,34 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
     cudaMemcpy(
         nodes,
         u.nodes,
-        (2*numTris-1)*sizeof(Node),
+        maxNodes*sizeof(Node),
         cudaMemcpyDeviceToHost);
 
     printf("\n====== STATS ======\n");
 
     float totalHorizTimeMs = 0.0f;
     cudaEventElapsedTime(
-        &totalHorizTimeMs, 
-        horizTimes[0], 
-        horizTimes[HORIZONTAL_LEVELS]);
+        &totalHorizTimeMs, times[0], times[HORIZONTAL_LEVELS]);
     printf("Horizontal: %f ms\n", totalHorizTimeMs);
 
     for(int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
         float horizTimeMs = 0.0f;
-        cudaEventElapsedTime(
-            &horizTimeMs,
-            horizTimes[hLevel],
-            horizTimes[hLevel+1]);
+        cudaEventElapsedTime(&horizTimeMs, times[hLevel], times[hLevel+1]);
         printf("  ↪ %2u: %f ms\n", hLevel, horizTimeMs);
     }
 
     float totalVerticalTimeMs = 0.0f;
     cudaEventElapsedTime(
-        &totalVerticalTimeMs,
-        horizTimes[HORIZONTAL_LEVELS],
-        verticalEnd);
+        &totalVerticalTimeMs, times[HORIZONTAL_LEVELS], times[levels]);
     printf("Vertical: %f ms\n", totalVerticalTimeMs);
     
+    for (int vLevel = 0; vLevel < verticalLevels; ++vLevel) {
+        auto level = vLevel + HORIZONTAL_LEVELS;
+        float verticalTimeMs = 0.0f;
+        cudaEventElapsedTime(&verticalTimeMs, times[level], times[level+1]);
+        printf("  ↪ %2u: %f ms\n", vLevel, verticalTimeMs);
+    }
+
     // Debug info
     printf("Geometry Min: [%f, %f, %f]\nGeometry Max: [%f, %f, %f]\n", 
         nodes[0].tMin.x, nodes[0].tMin.y, nodes[0].tMin.z,
@@ -892,7 +950,7 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
         nodeCountPerLevel[level] += 1;
         
         Node& node = nodes[nodeId];
-        if ( !(node.isLeaf() || 2*nodeId+2 >= u.numTris) ){
+        if ( !(node.isLeaf() || 2*nodeId+2 >= maxNodes) ){
             queue.push_back({2*nodeId+1, level+1});
             queue.push_back({2*nodeId+2, level+1});
         }
