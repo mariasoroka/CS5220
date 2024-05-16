@@ -694,13 +694,13 @@ std::shared_ptr<CudaBVH> build_cuda_bvh(
 
     // Horizontal binning
     cudaEventRecord(horizStart);
-    for (int hLevel = 0; hLevel < 9; ++hLevel) {
+    for (int hLevel = 0; hLevel < HORIZONTAL_LEVELS; ++hLevel) {
         uint twoLevel = (1 << hLevel);
         horizontalClearBins<<<twoLevel, WARP_THREADS>>>(u);
-        horizontalPrebin<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
+        horizontalPrebin<<<QUEUE_SIZE, OPT_THREADS>>>(u, hLevel);
         horizontalScan<<<twoLevel, WARP_THREADS>>>(u, hLevel);
-        horizontalPartition<<<OPT_BLOCKS, OPT_THREADS>>>(u, hLevel);
-        horizontalValidate<<<twoLevel, 1>>>(u, hLevel);
+        horizontalPartition<<<QUEUE_SIZE, OPT_THREADS>>>(u, hLevel);
+        // horizontalValidate<<<twoLevel, 1>>>(u, hLevel);
     }
     cudaEventRecord(horizEnd);
 
