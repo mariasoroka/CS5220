@@ -11,7 +11,9 @@
 
 #include <cassert>
 
-#define NUM_THREADS 4
+#define NUM_THREADS 16
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
 /*A datastructure used during the tree construction. Each instance stores
 
@@ -69,7 +71,7 @@ positions of triangle centers (triangle_centers) and indices of triangles array 
 
 SplitNode get_split_node(const StackNode &node, float split_loc, int axis,
 
-                         const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers)
+                         const AABB *triangle_bounds, int *triangle_idxs, const Vector3 *triangle_centers, bool remove_degenerate)
 
 {
 
@@ -84,12 +86,14 @@ SplitNode get_split_node(const StackNode &node, float split_loc, int axis,
                              });
 
     // if the split is degenerate, put half of the triangles in each group
-
-    if (it == triangle_idxs + node.i0 || it == triangle_idxs + node.i1)
-
+    if (remove_degenerate)
     {
+        if (it == triangle_idxs + node.i0 || it == triangle_idxs + node.i1)
 
-        it = triangle_idxs + (node.i0 + node.i1) / 2;
+        {
+
+            it = triangle_idxs + (node.i0 + node.i1) / 2;
+        }
     }
 
     // compute bounding boxes of the two groups of triangles
@@ -127,38 +131,37 @@ SplitNode get_split_node(int start, int end, float split_loc, int axis,
 
     auto it = std::partition(triangle_idxs + start, triangle_idxs + end,
 
-                             [triangle_idxs, triangle_centers, &split_loc, &axis](int i)
+                             [&triangle_centers, &split_loc, &axis](int i)
 
                              {
                                  return (triangle_centers[i][axis] < split_loc);
                              });
 
-    // if the split is degenerate, put half of the triangles in each group
 
-    if (it == triangle_idxs + start || it == triangle_idxs + end)
-
-    {
-
-        it = triangle_idxs + (start + end) / 2;
-    }
 
     // compute bounding boxes of the two groups of triangles
+    AABB aabb0 = AABB();
+    AABB aabb1 = AABB();
+    if (it != triangle_idxs + start) {
+        aabb0 = std::transform_reduce(triangle_idxs + start, it, AABB(), merge,
 
-    AABB aabb0 = std::transform_reduce(triangle_idxs + start, it, AABB(), merge,
+                                        [&triangle_bounds](int i)
 
-                                       [triangle_idxs, triangle_bounds](int i)
+                                        {
+                                            return triangle_bounds[i];
+                                        });
+    }
 
-                                       {
-                                           return triangle_bounds[i];
-                                       });
+    if (it != triangle_idxs + end) {
 
-    AABB aabb1 = std::transform_reduce(it, triangle_idxs + end, AABB(), merge,
+        aabb1 = std::transform_reduce(it, triangle_idxs + end, AABB(), merge,
 
-                                       [triangle_idxs, triangle_bounds](int i)
+                                        [&triangle_bounds](int i)
 
-                                       {
-                                           return triangle_bounds[i];
-                                       });
+                                        {
+                                            return triangle_bounds[i];
+                                        });
+    }
 
     int split_idx = it - triangle_idxs;
 
@@ -189,7 +192,7 @@ void get_costs(const StackNode &node, float *costs, const AABB *triangle_bounds,
 
         // get the two children of the node if it is split at split_loc
 
-        SplitNode split_node = get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+        SplitNode split_node = get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers, false);
 
         // if the split is degenerate, set the cost to infinity
 
@@ -254,7 +257,7 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     float split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
 
-    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers, true);
 }
 
 SplitNode split(const StackNode &node, const AABB *triangle_bounds,
@@ -292,7 +295,7 @@ SplitNode split(const StackNode &node, const AABB *triangle_bounds,
 
     float split_loc = node.aabb.pmin[axis] + diag[axis] * (split_bin + 1) / (n_bins + 1);
 
-    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+    return get_split_node(node, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers, true);
 }
 
 /*This function builds a BVH for the given set of triangles.*/
@@ -327,6 +330,7 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
 
         triangle_idxs[i] = i;
     }
+
 
 
 // #pragma omp declare reduction(                             \
@@ -405,17 +409,29 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             // each thread works on a subsection of triangles
             int thread_idx = omp_get_thread_num();
             int curr_num_triangles = node.i1 - node.i0;
-            int start = node.i0 + thread_idx * (curr_num_triangles) / NUM_THREADS;
-            int end = node.i0 + (thread_idx == NUM_THREADS - 1 ? curr_num_triangles : (thread_idx + 1) * curr_num_triangles / NUM_THREADS);
-
-            for (int i = 0; i < n_bins; i++)
-            {
-                float split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
-                SplitNode sub_split_node = get_split_node(start, end, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
-                num_n0[thread_idx][i] = sub_split_node.child0.i1 - sub_split_node.child0.i0;
-                num_n1[thread_idx][i] = sub_split_node.child1.i1 - sub_split_node.child1.i0;
-                AABB_n0[thread_idx][i] = sub_split_node.child0.aabb;
-                AABB_n1[thread_idx][i] = sub_split_node.child1.aabb;
+            int n_per_thread = (curr_num_triangles + NUM_THREADS) / NUM_THREADS;
+            int start = node.i0 + min(thread_idx * n_per_thread, curr_num_triangles);
+            int end = node.i0 + min((thread_idx + 1) * n_per_thread, curr_num_triangles);
+            // int end = node.i0 + (thread_idx == NUM_THREADS - 1 ? curr_num_triangles : (thread_idx + 1) * (curr_num_triangles / NUM_THREADS));
+            if (start != end) {
+                for (int i = 0; i < n_bins; i++)
+                {
+                    float split_loc = node.aabb.pmin[axis] + diag[axis] * (i + 1) / (n_bins + 1);
+                    SplitNode sub_split_node = get_split_node(start, end, split_loc, axis, triangle_bounds, triangle_idxs, triangle_centers);
+                    num_n0[thread_idx][i] = sub_split_node.child0.i1 - sub_split_node.child0.i0;
+                    num_n1[thread_idx][i] = sub_split_node.child1.i1 - sub_split_node.child1.i0;
+                    AABB_n0[thread_idx][i] = sub_split_node.child0.aabb;
+                    AABB_n1[thread_idx][i] = sub_split_node.child1.aabb;
+                }
+            }
+            else {
+                for (int i = 0; i < n_bins; i++)
+                {
+                    num_n0[thread_idx][i] = 0;
+                    num_n1[thread_idx][i] = 0;
+                    AABB_n0[thread_idx][i] = AABB();
+                    AABB_n1[thread_idx][i] = AABB();
+                }
             }
         }
 
@@ -426,12 +442,22 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             int total_num_n0 = 0;
             int total_num_n1 = 0;
             for(int j = 0; j < NUM_THREADS; ++j) {
-                total_num_n0+= num_n0[j][i];
-                total_num_n1+= num_n1[j][i];
+                total_num_n0 += num_n0[j][i];
+                total_num_n1 += num_n1[j][i];
                 total_AABB_n0 = merge(total_AABB_n0, AABB_n0[j][i]);
                 total_AABB_n1 = merge(total_AABB_n1, AABB_n1[j][i]);
+                // std::cout << get_area(total_AABB_n0) << " " << get_area(total_AABB_n1) << std::endl;
             }
-            costs[i] = get_area(total_AABB_n0) * (total_num_n0) + get_area(total_AABB_n1) * (total_num_n1);
+            // std::cout << "total num n0 is " << total_num_n0 << " total num n1 is " << total_num_n1 << std::endl;
+            // std::cout << "area 0 " << get_area(total_AABB_n0) << " area 1 " << get_area(total_AABB_n1) << std::endl;
+            if (total_num_n0 == 0 || total_num_n1 == 0) {
+                costs[i] = infinity();
+            }
+            else {
+                costs[i] = get_area(total_AABB_n0) * (total_num_n0) + get_area(total_AABB_n1) * (total_num_n1);
+            }
+            // assert (total_num_n0 + total_num_n1 == node.i1 - node.i0);
+            // assert (merge(total_AABB_n0, total_AABB_n1) == node.aabb);
 
         }
         SplitNode split_node = split(node, triangle_bounds, triangle_idxs, n_bins, triangle_centers, costs);
@@ -461,7 +487,7 @@ BVH build_bvh(triangle *triangles, int num_triangles, int max_triangles, int n_b
             {
                 bvh.nodes[node_idx].aabb = child.aabb;
                 bvh.nodes[node_idx].is_leaf = false;
-                queue.push_back({node_idx, child.aabb, child.i0, child.i1, child.level});
+                queue.push_back({node_idx, child.aabb, child.i0, child.i1, node.level + 1});
                 bvh.nodes[node.node_idx].children[i] = &bvh.nodes[node_idx];
                 node_idx++;
             }
